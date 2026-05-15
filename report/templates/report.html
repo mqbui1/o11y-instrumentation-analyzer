@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Splunk O11y Instrumentation Analysis</title>
+<style>
+  :root {
+    --ok: #2d9d5c;
+    --warn: #e67e22;
+    --crit: #e74c3c;
+    --info: #3498db;
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --score-bg: #21262d;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: var(--bg); color: var(--text); line-height: 1.6; padding: 24px; }
+  h1 { font-size: 1.6rem; margin-bottom: 4px; }
+  h2 { font-size: 1.15rem; margin: 28px 0 12px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 0.95rem; margin: 16px 0 8px; color: var(--muted); }
+  .meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 24px; }
+  .meta span { margin-right: 16px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .card .label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .card .value { font-size: 1.6rem; font-weight: 700; margin: 4px 0; }
+  .card .sub { font-size: 0.8rem; color: var(--muted); }
+  .score-bar { height: 8px; border-radius: 4px; background: var(--score-bg); margin: 6px 0; overflow: hidden; }
+  .score-fill { height: 100%; border-radius: 4px; transition: width 0.5s; }
+  .ok { color: var(--ok); }
+  .warn { color: var(--warn); }
+  .crit { color: var(--crit); }
+  .info-color { color: var(--info); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;
+           font-weight: 600; text-transform: uppercase; }
+  .badge-ok { background: rgba(45,157,92,0.15); color: var(--ok); border: 1px solid rgba(45,157,92,0.3); }
+  .badge-partial { background: rgba(230,126,34,0.15); color: var(--warn); border: 1px solid rgba(230,126,34,0.3); }
+  .badge-broken { background: rgba(231,76,60,0.15); color: var(--crit); border: 1px solid rgba(231,76,60,0.3); }
+  .badge-warn { background: rgba(230,126,34,0.15); color: var(--warn); border: 1px solid rgba(230,126,34,0.3); }
+  .badge-crit { background: rgba(231,76,60,0.15); color: var(--crit); border: 1px solid rgba(231,76,60,0.3); }
+  .badge-info { background: rgba(52,152,219,0.15); color: var(--info); border: 1px solid rgba(52,152,219,0.3); }
+  .link-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+               padding: 16px; margin-bottom: 12px; }
+  .link-card.broken { border-left: 3px solid var(--crit); }
+  .link-card.partial { border-left: 3px solid var(--warn); }
+  .link-card.ok { border-left: 3px solid var(--ok); }
+  .link-title { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .link-title h3 { margin: 0; font-size: 0.95rem; color: var(--text); }
+  .conditions { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .cond { font-size: 0.78rem; padding: 2px 8px; border-radius: 3px; }
+  .cond-pass { background: rgba(45,157,92,0.1); color: var(--ok); }
+  .cond-fail { background: rgba(231,76,60,0.1); color: var(--crit); }
+  .impact-box { font-size: 0.82rem; color: var(--muted); background: rgba(255,255,255,0.03);
+                border-radius: 4px; padding: 6px 10px; margin-top: 8px; }
+  .fix-box { font-size: 0.82rem; color: #79c0ff; background: rgba(121,192,255,0.05);
+             border-radius: 4px; padding: 6px 10px; margin-top: 6px; }
+  .recs { list-style: none; }
+  .recs li { background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+             padding: 10px 14px; margin-bottom: 8px; font-size: 0.88rem; }
+  .signal-section { background: var(--surface); border: 1px solid var(--border);
+                    border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+  .signal-meta { display: flex; flex-wrap: wrap; gap: 16px; font-size: 0.82rem;
+                 color: var(--muted); margin-bottom: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th { background: rgba(255,255,255,0.04); padding: 6px 10px; text-align: left;
+       font-weight: 600; font-size: 0.75rem; color: var(--muted); text-transform: uppercase;
+       letter-spacing: 0.04em; border-bottom: 1px solid var(--border); }
+  td { padding: 6px 10px; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  tr:last-child td { border-bottom: none; }
+  code { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.85em;
+         background: rgba(255,255,255,0.06); padding: 1px 5px; border-radius: 3px; }
+  .pct-bar { display: flex; align-items: center; gap: 6px; }
+  .pct-track { flex: 1; height: 5px; border-radius: 3px; background: var(--score-bg); overflow: hidden; }
+  .pct-fill-ok { height: 100%; background: var(--ok); }
+  .pct-fill-warn { height: 100%; background: var(--warn); }
+  .pct-fill-crit { height: 100%; background: var(--crit); }
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 0; }
+  .tab { padding: 8px 16px; font-size: 0.85rem; cursor: pointer; border-radius: 6px 6px 0 0;
+         border: 1px solid transparent; border-bottom: none; color: var(--muted); }
+  .tab.active { background: var(--surface); border-color: var(--border); color: var(--text);
+                margin-bottom: -1px; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .summary-text { color: var(--muted); font-size: 0.9rem; margin-bottom: 16px; font-style: italic; }
+</style>
+</head>
+<body>
+
+<h1>Splunk Observability Instrumentation Analysis</h1>
+<div class="meta" id="meta"></div>
+
+<div id="score-cards" class="cards"></div>
+
+<h2>Related Content Link Status</h2>
+<div id="rc-links"></div>
+
+<h2>Top Recommendations</h2>
+<ul class="recs" id="recs"></ul>
+
+<h2>Signal Details</h2>
+<div class="tabs">
+  <div class="tab active" onclick="showTab('apm')">APM</div>
+  <div class="tab" onclick="showTab('metrics')">Infrastructure Metrics</div>
+  <div class="tab" onclick="showTab('logs')">Logs</div>
+</div>
+<div id="apm" class="tab-content active"></div>
+<div id="metrics" class="tab-content"></div>
+<div id="logs" class="tab-content"></div>
+
+<script>
+const REPORT = __REPORT_JSON__;
+
+function scoreColor(s) {
+  if (s >= 80) return 'var(--ok)';
+  if (s >= 50) return 'var(--warn)';
+  return 'var(--crit)';
+}
+
+function badge(status) {
+  const map = {ok:'badge-ok',partial:'badge-partial',broken:'badge-broken',warning:'badge-warn',critical:'badge-crit',info:'badge-info'};
+  return `<span class="badge ${map[status]||'badge-info'}">${status}</span>`;
+}
+
+function pctBar(pct, severity) {
+  const cls = severity==='critical'?'pct-fill-crit':severity==='warning'?'pct-fill-warn':'pct-fill-ok';
+  return `<div class="pct-bar"><div class="pct-track"><div class="${cls}" style="width:${pct}%"></div></div><span>${pct}%</span></div>`;
+}
+
+function init() {
+  const meta = REPORT.meta || {};
+  const cor = REPORT.correlation || {};
+
+  // Meta
+  let metaHtml = `<span>Generated: ${meta.generated_at||''}</span><span>Realm: <code>${meta.realm||''}</code></span>`;
+  if (meta.service) metaHtml += `<span>Service: <code>${meta.service}</code></span>`;
+  if (meta.environment) metaHtml += `<span>Environment: <code>${meta.environment}</code></span>`;
+  document.getElementById('meta').innerHTML = metaHtml;
+
+  // Score cards
+  const score = cor.combined_score || 0;
+  const apmScore = REPORT.apm?.score ?? '–';
+  const mScore = REPORT.metrics?.score ?? '–';
+  const lScore = REPORT.logs?.score ?? '–';
+  document.getElementById('score-cards').innerHTML = `
+    <div class="card">
+      <div class="label">Overall Score</div>
+      <div class="value" style="color:${scoreColor(score)}">${score}<span style="font-size:1rem;color:var(--muted)">/100</span></div>
+      <div class="score-bar"><div class="score-fill" style="width:${score}%;background:${scoreColor(score)}"></div></div>
+      <div class="sub">${badge(cor.overall_status||'unknown')}</div>
+    </div>
+    <div class="card">
+      <div class="label">APM Score</div>
+      <div class="value" style="color:${scoreColor(apmScore)}">${apmScore}<span style="font-size:1rem;color:var(--muted)">/100</span></div>
+      <div class="score-bar"><div class="score-fill" style="width:${apmScore}%;background:${scoreColor(apmScore)}"></div></div>
+      <div class="sub">${(REPORT.apm?.spans_sampled||0).toLocaleString()} spans sampled</div>
+    </div>
+    <div class="card">
+      <div class="label">Metrics Score</div>
+      <div class="value" style="color:${scoreColor(mScore)}">${mScore}<span style="font-size:1rem;color:var(--muted)">/100</span></div>
+      <div class="score-bar"><div class="score-fill" style="width:${mScore}%;background:${scoreColor(mScore)}"></div></div>
+      <div class="sub">${(REPORT.metrics?.mts_sampled||0).toLocaleString()} MTS sampled</div>
+    </div>
+    <div class="card">
+      <div class="label">Logs Score</div>
+      <div class="value" style="color:${scoreColor(lScore)}">${lScore}<span style="font-size:1rem;color:var(--muted)">/100</span></div>
+      <div class="score-bar"><div class="score-fill" style="width:${lScore}%;background:${scoreColor(lScore)}"></div></div>
+      <div class="sub">${(REPORT.logs?.logs_sampled||0).toLocaleString()} logs sampled</div>
+    </div>
+    <div class="card">
+      <div class="label">RC Links</div>
+      <div class="value"><span class="ok">${cor.ok_count||0}</span> / <span class="warn">${cor.partial_count||0}</span> / <span class="crit">${cor.broken_count||0}</span></div>
+      <div class="sub">OK / Partial / Broken</div>
+    </div>
+  `;
+
+  // Summary text
+  const sumText = cor.summary || '';
+  if (sumText) {
+    const el = document.createElement('div');
+    el.className = 'summary-text';
+    el.textContent = sumText;
+    document.getElementById('rc-links').before(el);
+  }
+
+  // RC Links
+  const linksHtml = (cor.links||[]).map(link => {
+    const conds = (link.conditions||[]).map(c =>
+      `<div class="cond ${c.pass?'cond-pass':'cond-fail'}">${c.pass?'✓':'✗'} ${c.check}</div>`
+    ).join('');
+    const impact = link.impact ? `<div class="impact-box">⚡ ${link.impact}</div>` : '';
+    const fix = link.fix ? `<div class="fix-box">🔧 ${link.fix}</div>` : '';
+    return `<div class="link-card ${link.status}">
+      <div class="link-title"><h3>${link.link}</h3>${badge(link.status)}</div>
+      <div class="conditions">${conds}</div>
+      ${impact}${fix}
+    </div>`;
+  }).join('');
+  document.getElementById('rc-links').innerHTML = linksHtml;
+
+  // Recommendations
+  const recsHtml = (cor.top_recommendations||[]).map(r =>
+    `<li>${badge(r.severity||'info')} <strong>${r.link}</strong> — ${r.recommendation}</li>`
+  ).join('');
+  document.getElementById('recs').innerHTML = recsHtml || '<li style="color:var(--muted)">No recommendations — instrumentation looks good!</li>';
+
+  // Signal sections
+  renderSignal('apm', REPORT.apm||{}, 'attribute', 'spans_sampled');
+  renderSignal('metrics', REPORT.metrics||{}, 'dimension', 'mts_sampled');
+  renderSignal('logs', REPORT.logs||{}, 'field', 'logs_sampled');
+}
+
+function renderSignal(id, result, keyName, countKey) {
+  const el = document.getElementById(id);
+  if (result.error) { el.innerHTML = `<div class="signal-section"><p class="crit">Error: ${result.error}</p></div>`; return; }
+  if (!result[countKey] && !result.traces_sampled) {
+    el.innerHTML = `<div class="signal-section"><p style="color:var(--muted)">No data sampled.</p></div>`;
+    return;
+  }
+
+  const sampled = result[countKey] || result.traces_sampled || 0;
+  let metaItems = [`<span>Score: <strong style="color:${scoreColor(result.score||0)}">${result.score||0}/100</strong></span>`,
+                   `<span>Sampled: <strong>${sampled.toLocaleString()}</strong></span>`];
+  if (result.services_seen?.length) metaItems.push(`<span>Services: ${result.services_seen.slice(0,5).join(', ')}</span>`);
+  if (result.environments_seen?.length) metaItems.push(`<span>Envs: ${result.environments_seen.join(', ')}</span>`);
+  if (result.mode_description) metaItems.push(`<span>Mode: ${result.mode_description}</span>`);
+  if (result.trace_id_coverage_pct !== undefined) metaItems.push(`<span>Trace ID coverage: ${result.trace_id_coverage_pct}%</span>`);
+
+  const findings = result.findings || [];
+  let tableHtml = '';
+  if (findings.length) {
+    const rows = findings.map(f => {
+      const attr = f[keyName] || f.attribute || f.dimension || f.field || '';
+      const presentPct = f.present_pct || 0;
+      const missingPct = f.missing_pct || 0;
+      const rc = f.related_content ? '<span title="Related Content">🔗</span>' : '';
+      return `<tr>
+        <td><code>${attr}</code> ${rc}</td>
+        <td>${badge(f.severity)}</td>
+        <td>${badge(f.status)}</td>
+        <td>${pctBar(presentPct, f.severity)}</td>
+        <td style="color:var(--muted);font-size:0.78rem">${(f.purpose||'').substring(0,70)}</td>
+      </tr>`;
+    }).join('');
+    tableHtml = `<table><thead><tr><th>${keyName.charAt(0).toUpperCase()+keyName.slice(1)}</th><th>Severity</th><th>Status</th><th>Present</th><th>Purpose</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } else {
+    tableHtml = '<p style="color:var(--ok);font-size:0.88rem">All attributes/dimensions present. ✓</p>';
+  }
+
+  // RC gaps
+  let rcGapsHtml = '';
+  const rcGaps = result.related_content_gaps || [];
+  if (rcGaps.length) {
+    const items = rcGaps.map(g => `<li>${badge(g.severity)} <strong>${g.link}</strong> — ${g.impact}</li>`).join('');
+    rcGapsHtml = `<h3>Related Content Gaps</h3><ul class="recs">${items}</ul>`;
+  }
+
+  // LOC findings
+  let locHtml = '';
+  const locFindings = result.loc_findings || [];
+  if (locFindings.length) {
+    const items = locFindings.map(lf => `<li>${badge(lf.severity)} ${lf.message}</li>`).join('');
+    locHtml = `<h3>Log Observer Connect Findings</h3><ul class="recs">${items}</ul>`;
+  }
+
+  el.innerHTML = `<div class="signal-section">
+    <div class="signal-meta">${metaItems.join('')}</div>
+    ${tableHtml}
+    ${rcGapsHtml}
+    ${locHtml}
+  </div>`;
+}
+
+function showTab(id) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  const tabs = ['apm','metrics','logs'];
+  const idx = tabs.indexOf(id);
+  document.querySelectorAll('.tab')[idx].classList.add('active');
+}
+
+init();
+</script>
+</body>
+</html>
