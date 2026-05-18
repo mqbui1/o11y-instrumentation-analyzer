@@ -35,11 +35,11 @@ def _sample_mts(
     limit: int = 200,
 ) -> list[dict]:
     """Sample active MTS from the catalog, optionally scoped to service/env."""
-    filters = ["active:true"]
+    filters = []
     if service:
         filters.append(f'sf_service:"{service}"')
     if environment:
-        filters.append(f'sf_environment:"{environment}" OR deployment.environment:"{environment}"')
+        filters.append(f'sf_environment:"{environment}" OR deployment.environment:"{environment}" OR k8s.cluster.name:"{environment}"')
 
     query = " AND ".join(filters)
     try:
@@ -215,6 +215,20 @@ def _check_rc_gaps_metrics(dim_presence: dict[str, int], total: int) -> list[dic
             "missing": ["sf_environment / deployment.environment"],
             "impact": "Metrics cannot be scoped to an environment. "
                       "Service Centric view infrastructure tab will be empty.",
+        })
+
+    # sf_service (or service.name) must be present on K8s/host metrics for IM→APM
+    # Related Content to work. This is the primary linking field — without it the
+    # Host Navigator cannot resolve which APM service a host/pod belongs to.
+    svc_ok = _has("sf_service") or _has("service.name")
+    if not svc_ok:
+        gaps.append({
+            "link": "Infrastructure Monitoring → APM",
+            "severity": "warning",
+            "missing": ["sf_service / service.name"],
+            "impact": "Host Navigator and K8s Navigator cannot link to APM service context. "
+                      "The IM→APM Related Content tile will not appear. "
+                      "Note: service.name is mapped to sf_service at ingest — either is acceptable.",
         })
 
     return gaps

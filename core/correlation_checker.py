@@ -29,8 +29,12 @@ def check_cross_signal_correlation(
     im_has_host = _result_has_attr(metrics_result, "metrics", {"host.name", "host", "k8s.pod.name"})
     apm_has_env = _result_has_attr(apm_result, "apm", {"deployment.environment"})
     im_has_env = _result_has_attr(metrics_result, "metrics", {"sf_environment", "deployment.environment"})
+    # sf_service is the primary field the Related Content engine uses to join IM metrics to APM.
+    # service.name is treated as equivalent (mapped to sf_service at ingest) but sf_service
+    # is what's actually checked under the covers.
+    im_has_svc = _result_has_attr(metrics_result, "metrics", {"sf_service", "service.name"})
 
-    apm_im_ok = apm_has_host and im_has_host and apm_has_env and im_has_env
+    apm_im_ok = apm_has_host and im_has_host and apm_has_env and im_has_env and im_has_svc
     link_status.append({
         "link": "APM → Infrastructure Monitoring",
         "status": "ok" if apm_im_ok else "broken",
@@ -40,9 +44,10 @@ def check_cross_signal_correlation(
             {"check": "IM metrics have host.name/host dimension", "pass": im_has_host},
             {"check": "APM spans have deployment.environment", "pass": apm_has_env},
             {"check": "IM metrics have sf_environment/deployment.environment", "pass": im_has_env},
+            {"check": "IM metrics have sf_service/service.name (required for IM→APM link)", "pass": im_has_svc},
         ],
         "impact": "Service Centric view infrastructure tab will be empty." if not apm_im_ok else None,
-        "fix": _apm_im_fix(apm_has_host, im_has_host, apm_has_env, im_has_env) if not apm_im_ok else None,
+        "fix": _apm_im_fix(apm_has_host, im_has_host, apm_has_env, im_has_env, im_has_svc) if not apm_im_ok else None,
     })
 
     # ── APM ↔ Logs ───────────────────────────────────────────────────────────
@@ -146,7 +151,7 @@ def _log_mode_label(mode: str) -> str:
     }.get(mode, mode)
 
 
-def _apm_im_fix(apm_has_host: bool, im_has_host: bool, apm_has_env: bool, im_has_env: bool) -> str:
+def _apm_im_fix(apm_has_host: bool, im_has_host: bool, apm_has_env: bool, im_has_env: bool, im_has_svc: bool = True) -> str:
     fixes = []
     if not apm_has_host:
         fixes.append("Add host.name resource attribute to APM instrumentation (set via OTEL_RESOURCE_ATTRIBUTES or SDK resource detector).")
@@ -156,6 +161,8 @@ def _apm_im_fix(apm_has_host: bool, im_has_host: bool, apm_has_env: bool, im_has
         fixes.append("Set deployment.environment in APM spans (OTEL_RESOURCE_ATTRIBUTES=deployment.environment=<env>).")
     if not im_has_env:
         fixes.append("Add sf_environment or deployment.environment dimension to infrastructure metrics.")
+    if not im_has_svc:
+        fixes.append("Add sf_service (or service.name) dimension to K8s/host metrics — this is the primary field the Related Content engine uses to join IM to APM. In the Splunk OTel Collector, enable the resourcedetection processor or set service.name via extraDimensions.")
     return " ".join(fixes)
 
 

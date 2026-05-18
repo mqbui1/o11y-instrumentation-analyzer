@@ -61,14 +61,19 @@ METRICS_RULES: list[AttributeRule] = [
     AttributeRule("k8s.cluster.name", "warning", "Cluster scoping for K8s Navigator"),
     AttributeRule("k8s.namespace.name", "warning", "Namespace dimension for K8s Navigator"),
     AttributeRule("container.name", "info", "Container-level breakdown"),
-    AttributeRule("service.name", "info", "Links IM metrics to APM service context", related_content=True),
+    # sf_service is the Splunk-internal dimension used to link IM metrics back to an APM service.
+    # The platform treats sf_service and service.name as equivalent when querying, but sf_service
+    # is the field the Related Content engine actually looks for on K8s/host metrics.
+    AttributeRule("sf_service", "warning", "Links IM metrics to APM service — primary field for IM↔APM Related Content. OTel convention service.name is mapped to sf_service at ingest.", related_content=True, alternatives=["service.name"]),
     AttributeRule("cloud.provider", "info", "Cloud provider identification (aws/gcp/azure)"),
     AttributeRule("cloud.region", "info", "Cloud region dimension"),
     AttributeRule("cloud.account.id", "info", "Cloud account scoping"),
 ]
 
 # Dimensions required for IM ↔ APM Related Content
-IM_TO_APM_LINK_DIMS = {"host.name", "host", "k8s.pod.name"}
+# sf_service (or its OTel equivalent service.name) must be present on K8s/host metrics
+# for the IM → APM Related Content link to function.
+IM_TO_APM_LINK_DIMS = {"host.name", "host", "k8s.pod.name", "sf_service"}
 
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
@@ -121,8 +126,8 @@ RELATED_CONTENT_LINKS = [
     {
         "from": "Infrastructure Monitoring",
         "to": "APM",
-        "required_attrs": ["service.name", "sf_environment OR deployment.environment"],
-        "description": "Host Navigator → APM service context",
+        "required_attrs": ["sf_service (or service.name)", "sf_environment OR deployment.environment"],
+        "description": "Host Navigator → APM service context. sf_service is the primary field; service.name is mapped to sf_service at ingest.",
     },
     {
         "from": "Infrastructure Monitoring",
