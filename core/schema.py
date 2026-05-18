@@ -52,15 +52,16 @@ APM_TO_LOGS_LINK_ATTRS = {"deployment.environment", "service.name"}
 # ── Metrics (IM) ──────────────────────────────────────────────────────────────
 
 METRICS_RULES: list[AttributeRule] = [
-    AttributeRule("host.name", "critical", "Host identity — required for Host Navigator and IM dashboards", related_content=True, alternatives=["host"]),
-    AttributeRule("host", "critical", "Host identity (legacy convention)", related_content=True, alternatives=["host.name"]),
+    AttributeRule("host.name", "critical", "Host identity — required for Host Navigator and IM dashboards", related_content=True, alternatives=["host", "aws_private_dns_name", "instance_name", "azure_computer_name"]),
+    AttributeRule("host", "critical", "Host identity (legacy convention)", related_content=True, alternatives=["host.name", "aws_private_dns_name", "instance_name", "azure_computer_name"]),
     AttributeRule("sf_environment", "warning", "Environment scoping — required for Related Content to APM", related_content=True),
     AttributeRule("deployment.environment", "warning", "OTel environment convention — maps to sf_environment", related_content=True),
-    AttributeRule("k8s.pod.name", "warning", "Pod-level granularity for K8s Navigator", related_content=True),
-    AttributeRule("k8s.node.name", "warning", "Node-level rollup for K8s Navigator", related_content=True),
-    AttributeRule("k8s.cluster.name", "warning", "Cluster scoping for K8s Navigator"),
-    AttributeRule("k8s.namespace.name", "warning", "Namespace dimension for K8s Navigator"),
-    AttributeRule("container.name", "info", "Container-level breakdown"),
+    AttributeRule("k8s.pod.name", "warning", "Pod-level granularity for K8s Navigator", related_content=True, alternatives=["kubernetes_pod_name"]),
+    AttributeRule("k8s.node.name", "warning", "Node-level rollup for K8s Navigator", related_content=True, alternatives=["kubernetes_node"]),
+    AttributeRule("k8s.cluster.name", "warning", "Cluster scoping for K8s Navigator", related_content=True, alternatives=["kubernetes_cluster"]),
+    AttributeRule("k8s.namespace.name", "warning", "Namespace dimension for K8s Navigator", alternatives=["kubernetes_namespace"]),
+    AttributeRule("kubernetes_workload_name", "warning", "Workload-level grouping for K8s Navigator (Deployment/StatefulSet/DaemonSet)", related_content=True, alternatives=["k8s.workload.name"]),
+    AttributeRule("container.name", "info", "Container-level breakdown", alternatives=["k8s.container.name", "container.id"]),
     # sf_service is the Splunk-internal dimension used to link IM metrics back to an APM service.
     # The platform treats sf_service and service.name as equivalent when querying, but sf_service
     # is the field the Related Content engine actually looks for on K8s/host metrics.
@@ -68,12 +69,13 @@ METRICS_RULES: list[AttributeRule] = [
     AttributeRule("cloud.provider", "info", "Cloud provider identification (aws/gcp/azure)"),
     AttributeRule("cloud.region", "info", "Cloud region dimension"),
     AttributeRule("cloud.account.id", "info", "Cloud account scoping"),
+    AttributeRule("cloud.infrastructure_service", "info", "Cloud service type (e.g. EC2, EBS, RDS) — enables cloud-service-specific Related Content tiles"),
 ]
 
 # Dimensions required for IM ↔ APM Related Content
 # sf_service (or its OTel equivalent service.name) must be present on K8s/host metrics
 # for the IM → APM Related Content link to function.
-IM_TO_APM_LINK_DIMS = {"host.name", "host", "k8s.pod.name", "sf_service"}
+IM_TO_APM_LINK_DIMS = {"host.name", "host", "k8s.pod.name", "kubernetes_pod_name", "sf_service"}
 
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
@@ -88,9 +90,12 @@ LOGS_RULES: list[AttributeRule] = [
     AttributeRule("severity_number", "info", "Numeric severity for sorting/filtering"),
     AttributeRule("body", "critical", "Log message content"),
     AttributeRule("timestamp", "critical", "Log timestamp — required for timeline ordering", alternatives=["time", "@timestamp"]),
-    AttributeRule("k8s.pod.name", "info", "Pod-level log filtering"),
-    AttributeRule("k8s.namespace.name", "info", "Namespace-level log filtering"),
-    AttributeRule("container.name", "info", "Container log source identification"),
+    AttributeRule("k8s.pod.name", "info", "Pod-level log filtering", alternatives=["kubernetes_pod_name"]),
+    AttributeRule("k8s.namespace.name", "info", "Namespace-level log filtering", alternatives=["kubernetes_namespace"]),
+    AttributeRule("k8s.cluster.name", "info", "Cluster-level log filtering — enables K8s navigator Related Content from logs", alternatives=["kubernetes_cluster"]),
+    AttributeRule("kubernetes_workload_name", "info", "Workload-level log grouping (Deployment/StatefulSet/DaemonSet)", alternatives=["k8s.workload.name"]),
+    AttributeRule("container.name", "info", "Container log source identification", alternatives=["k8s.container.name"]),
+    AttributeRule("cloud.infrastructure_service", "info", "Cloud service type — enables cloud-service-specific Related Content from logs"),
 ]
 
 # Log Observer Connect (LOC) specific — Splunk Platform logs linked to O11y
@@ -134,6 +139,18 @@ RELATED_CONTENT_LINKS = [
         "to": "Logs",
         "required_attrs": ["host.name OR host", "deployment.environment"],
         "description": "Host Navigator → Related Logs",
+    },
+    {
+        "from": "APM",
+        "to": "Infrastructure Monitoring (Kubernetes)",
+        "required_attrs": ["service.name", "deployment.environment", "k8s.cluster.name"],
+        "description": "Service Centric view → Kubernetes cluster map / K8s Navigator",
+    },
+    {
+        "from": "APM / Infrastructure Monitoring",
+        "to": "Logs (K8s)",
+        "required_attrs": ["k8s.cluster.name", "k8s.pod.name OR k8s.node.name OR container.id"],
+        "description": "K8s Navigator → Related Logs for pod/node/container",
     },
 ]
 

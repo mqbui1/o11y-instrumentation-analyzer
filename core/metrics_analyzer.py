@@ -197,7 +197,7 @@ def _check_rc_gaps_metrics(dim_presence: dict[str, int], total: int) -> list[dic
     def _has(name: str, threshold: float = 0.5) -> bool:
         return dim_presence.get(name, 0) / total >= threshold
 
-    host_ok = _has("host.name") or _has("host")
+    host_ok = _has("host.name") or _has("host") or _has("aws_private_dns_name") or _has("instance_name") or _has("azure_computer_name")
     if not host_ok:
         gaps.append({
             "link": "Infrastructure Monitoring → APM / Logs",
@@ -207,7 +207,7 @@ def _check_rc_gaps_metrics(dim_presence: dict[str, int], total: int) -> list[dic
                       "Related Content links will be broken.",
         })
 
-    env_ok = _has("sf_environment") or _has("deployment.environment")
+    env_ok = _has("sf_environment") or _has("deployment.environment") or _has("k8s.cluster.name") or _has("kubernetes_cluster")
     if not env_ok:
         gaps.append({
             "link": "Infrastructure Monitoring → APM",
@@ -247,7 +247,7 @@ def _check_service_centric_gaps(
         return dim_presence.get(name, 0) / total >= threshold
 
     # Infrastructure metrics in Service Centric
-    if not (_has("host.name") or _has("host")):
+    if not (_has("host.name") or _has("host") or _has("k8s.pod.name") or _has("kubernetes_pod_name")):
         gaps.append({
             "check": "Infrastructure metrics in Service Centric view",
             "severity": "critical",
