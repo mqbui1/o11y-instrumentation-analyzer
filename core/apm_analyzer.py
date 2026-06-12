@@ -16,43 +16,12 @@ from .schema import APM_RULES, APM_TO_IM_LINK_ATTRS, APM_TO_LOGS_LINK_ATTRS, Att
 
 logger = logging.getLogger(__name__)
 
-_GRAPHQL_TRACE_SEARCH = """
-mutation searchTraces($query: String!, $limit: Int!, $startMs: Long!, $endMs: Long!) {
-  getAnalyticsSearch(
-    query: $query
-    startTimeMs: $startMs
-    endTimeMs: $endMs
-    limit: $limit
-    type: TRACE
-  ) {
-    sections {
-      sectionType
-      legacyTraceExamples {
-        traceId
-        spans {
-          spanId
-          parentSpanId
-          serviceName
-          operationName
-          startTimeMs
-          durationMs
-          tags { key value }
-          attributes { key value }
-          resourceAttributes { key value }
-        }
-      }
-    }
-  }
-}
-"""
-
-
-def _graphql_post(app_base: str, token: str, query: str, variables: dict) -> dict:
-    url = f"{app_base}/api/v2/graphql"
-    body = json.dumps({"query": query, "variables": variables}).encode("utf-8")
+def _gql_post(app_base: str, token: str, op: str, body: dict) -> dict:
+    url = f"{app_base}/v2/apm/graphql?op={op}"
+    data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url,
-        data=body,
+        data=data,
         headers={"X-SF-Token": token, "Content-Type": "application/json"},
         method="POST",
     )
@@ -72,22 +41,62 @@ def _search_traces(
     environment: str | None = None,
     limit: int = 20,
 ) -> list[dict]:
-    filters = []
+    tag_filters = []
     if service:
-        filters.append(f'service:"{service}"')
+        tag_filters.append({"tag": "service.name", "operation": "IN", "values": [service]})
     if environment:
-        filters.append(f'environment:"{environment}"')
-    query = " AND ".join(filters) if filters else "*"
+        tag_filters.append({"tag": "sf_environment", "operation": "IN", "values": [environment]})
 
-    payload = _graphql_post(app_base, token, _GRAPHQL_TRACE_SEARCH, {
-        "query": query, "limit": limit,
-        "startMs": start_ms, "endMs": end_ms,
-    })
-    traces = []
-    for section in (payload.get("data") or {}).get("getAnalyticsSearch", {}).get("sections") or []:
-        if section.get("sectionType") == "traceExamples":
-            traces.extend(section.get("legacyTraceExamples") or [])
-    return traces
+    parameters = {
+        "sharedParameters": {
+            "timeRangeMillis": {"gte": start_ms, "lte": end_ms},
+            "filters": [{"traceFilter": {"tags": tag_filters}, "filterType": "traceFilter"}],
+            "samplingFactor": 100,
+        },
+        "sectionsParameters": [{"sectionType": "traceExamples", "limit": limit}],
+    }
+    start_body = {
+        "operationName": "StartAnalyticsSearch",
+        "variables": {"parameters": parameters},
+        "query": "query StartAnalyticsSearch($parameters: JSON!) { startAnalyticsSearch(parameters: $parameters) }",
+    }
+    start_result = _gql_post(app_base, token, "StartAnalyticsSearch", start_body)
+    job_id = ((start_result.get("data") or {}).get("startAnalyticsSearch") or {}).get("jobId")
+    if not job_id:
+        raise RuntimeError(f"startAnalyticsSearch returned no jobId: {start_result}")
+
+    get_body = {
+        "operationName": "GetAnalyticsSearch",
+        "variables": {"jobId": job_id},
+        "query": "query GetAnalyticsSearch($jobId: ID!) { getAnalyticsSearch(jobId: $jobId) }",
+    }
+    delay, elapsed = 0.1, 0.0
+    while elapsed < 30.0:
+        result = _gql_post(app_base, token, "GetAnalyticsSearch", get_body)
+        sections = ((result.get("data") or {}).get("getAnalyticsSearch") or {}).get("sections", [])
+        for section in sections:
+            if section.get("sectionType") == "traceExamples" and section.get("isComplete"):
+                examples = section.get("legacyTraceExamples") or []
+                return [e["traceId"] for e in examples if e.get("traceId")][:limit]
+        time.sleep(delay)
+        elapsed += delay
+        delay = min(delay * 2, 2.0)
+    return []
+
+
+def _get_trace_full(app_base: str, token: str, trace_id: str) -> list[dict]:
+    """Fetch full span details for a single trace."""
+    body = {
+        "operationName": "TraceFullDetailsLessValidation",
+        "variables": {"id": trace_id},
+        "query": (
+            "query TraceFullDetailsLessValidation($id: ID!) {"
+            " trace(id: $id) { traceID spans { spanID operationName serviceName"
+            " startTime duration tags { key value } } } }"
+        ),
+    }
+    result = _gql_post(app_base, token, "TraceFullDetailsLessValidation", body)
+    return ((result.get("data") or {}).get("trace") or {}).get("spans") or []
 
 
 def _collect_span_attrs(span: dict) -> dict[str, str]:
@@ -123,11 +132,11 @@ def analyze_apm(
     logger.info("APM: sampling traces (lookback=%dh, service=%s, env=%s)", lookback_hours, service, environment)
 
     try:
-        traces = _search_traces(app_base, token, start_ms, now_ms, service, environment, limit=sample_size)
+        trace_ids = _search_traces(app_base, token, start_ms, now_ms, service, environment, limit=sample_size)
     except RuntimeError as e:
         return {"error": str(e), "traces_sampled": 0, "findings": [], "score": 0}
 
-    if not traces:
+    if not trace_ids:
         return {
             "error": None,
             "traces_sampled": 0,
@@ -136,13 +145,13 @@ def analyze_apm(
             "score": 0,
         }
 
-    # Collect all spans across sampled traces
+    # Fetch full span details for each trace (cap at 20 to avoid rate limits)
     all_spans: list[dict[str, str]] = []
     services_seen: set[str] = set()
     environments_seen: set[str] = set()
 
-    for trace in traces:
-        for span in trace.get("spans") or []:
+    for trace_id in trace_ids[:20]:
+        for span in _get_trace_full(app_base, token, trace_id):
             attrs = _collect_span_attrs(span)
             all_spans.append(attrs)
             if svc := attrs.get("service.name"):
@@ -151,7 +160,7 @@ def analyze_apm(
                 environments_seen.add(env)
 
     total_spans = len(all_spans)
-    logger.info("APM: sampled %d traces, %d spans across %d service(s)", len(traces), total_spans, len(services_seen))
+    logger.info("APM: sampled %d traces, %d spans across %d service(s)", len(trace_ids), total_spans, len(services_seen))
 
     # Check each rule across all sampled spans
     findings: list[dict] = []
@@ -202,7 +211,7 @@ def analyze_apm(
 
     return {
         "error": None,
-        "traces_sampled": len(traces),
+        "traces_sampled": len(trace_ids),
         "spans_sampled": total_spans,
         "services_seen": sorted(services_seen),
         "environments_seen": sorted(environments_seen),
@@ -220,13 +229,13 @@ def _check_rc_gaps_apm(attr_presence: dict[str, int], total: int) -> list[dict]:
     def _has(name: str, threshold: float = 0.5) -> bool:
         return attr_presence.get(name, 0) / total >= threshold
 
-    # APM → IM link
-    host_ok = _has("host.name") or _has("host.id") or _has("k8s.pod.name")
+    # APM → IM link — host.name is the primary field for Logs-Infra correlation (not host.id)
+    host_ok = _has("host.name") or _has("k8s.pod.name")
     if not host_ok:
         gaps.append({
             "link": "APM → Infrastructure Monitoring",
             "severity": "critical",
-            "missing": ["host.name / host.id / k8s.pod.name"],
+            "missing": ["host.name / k8s.pod.name"],
             "impact": "Service Centric view will not show host/container/K8s infrastructure tiles. "
                       "Related Content panel will not link to IM.",
         })

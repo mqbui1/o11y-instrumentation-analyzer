@@ -24,8 +24,8 @@ class AttributeRule:
 APM_RULES: list[AttributeRule] = [
     AttributeRule("service.name", "critical", "Service identity — required for all APM views", related_content=True),
     AttributeRule("deployment.environment", "critical", "Environment scoping — required for Service Centric view and Related Content", related_content=True),
-    AttributeRule("host.name", "warning", "Links APM to Infrastructure Monitoring (Related Content)", related_content=True, alternatives=["host.id"]),
-    AttributeRule("host.id", "warning", "Links APM to Infrastructure Monitoring", related_content=True, alternatives=["host.name"]),
+    AttributeRule("host.name", "warning", "Links APM to Infrastructure Monitoring and Logs (Related Content)", related_content=True),
+    AttributeRule("host.id", "info", "EC2 instance ID — present on EC2 spans; used for EC2 APM→IM host match but not for Logs-IM correlation"),
     AttributeRule("k8s.pod.name", "warning", "Kubernetes pod correlation — required for K8s navigator linking", related_content=True),
     AttributeRule("k8s.node.name", "warning", "Kubernetes node correlation", related_content=True),
     AttributeRule("k8s.namespace.name", "warning", "Kubernetes namespace scoping"),
@@ -43,7 +43,8 @@ APM_RULES: list[AttributeRule] = [
 ]
 
 # Attributes required for APM ↔ IM Related Content
-APM_TO_IM_LINK_ATTRS = {"host.name", "host.id", "k8s.pod.name"}
+# host.name is the primary linking field; host.id is not used for Logs-Infra correlation
+APM_TO_IM_LINK_ATTRS = {"host.name", "k8s.pod.name"}
 
 # Attributes required for APM ↔ Logs Related Content
 APM_TO_LOGS_LINK_ATTRS = {"deployment.environment", "service.name"}
@@ -113,7 +114,7 @@ RELATED_CONTENT_LINKS = [
     {
         "from": "APM",
         "to": "Infrastructure Monitoring",
-        "required_attrs": ["host.name OR host.id", "deployment.environment"],
+        "required_attrs": ["host.name", "deployment.environment"],
         "description": "Service Centric view → Host / Container / K8s tiles",
     },
     {

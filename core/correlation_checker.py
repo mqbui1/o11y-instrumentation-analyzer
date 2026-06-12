@@ -25,7 +25,8 @@ def check_cross_signal_correlation(
     link_status: list[dict] = []
 
     # ── APM ↔ IM ─────────────────────────────────────────────────────────────
-    apm_has_host = _result_has_attr(apm_result, "apm", {"host.name", "host.id", "k8s.pod.name"})
+    # host.name is the primary field for APM-IM correlation; host.id is not used for Logs-Infra
+    apm_has_host = _result_has_attr(apm_result, "apm", {"host.name", "k8s.pod.name"})
     im_has_host = _result_has_attr(metrics_result, "metrics", {"host.name", "host", "k8s.pod.name"})
     apm_has_env = _result_has_attr(apm_result, "apm", {"deployment.environment"})
     im_has_env = _result_has_attr(metrics_result, "metrics", {"sf_environment", "deployment.environment"})
@@ -40,7 +41,7 @@ def check_cross_signal_correlation(
         "status": "ok" if apm_im_ok else "broken",
         "severity": "critical" if not apm_im_ok else None,
         "conditions": [
-            {"check": "APM spans have host.name/host.id/k8s.pod.name", "pass": apm_has_host},
+            {"check": "APM spans have host.name/k8s.pod.name", "pass": apm_has_host},
             {"check": "IM metrics have host.name/host dimension", "pass": im_has_host},
             {"check": "APM spans have deployment.environment", "pass": apm_has_env},
             {"check": "IM metrics have sf_environment/deployment.environment", "pass": im_has_env},
