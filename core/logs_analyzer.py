@@ -34,6 +34,8 @@ def _api_post(api_base: str, token: str, path: str, body: dict) -> dict:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"HTTP {e.code}: {(e.read() or b'')[:300].decode()}")
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"Request failed: {e}")
 
 
 def _api_get(api_base: str, token: str, path: str, params: dict | None = None) -> dict:
@@ -45,6 +47,8 @@ def _api_get(api_base: str, token: str, path: str, params: dict | None = None) -
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"HTTP {e.code}: {(e.read() or b'')[:300].decode()}")
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"Request failed: {e}")
 
 
 def _search_logs(

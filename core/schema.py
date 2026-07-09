@@ -83,7 +83,7 @@ IM_TO_APM_LINK_DIMS = {"host.name", "host", "k8s.pod.name", "kubernetes_pod_name
 
 LOGS_RULES: list[AttributeRule] = [
     AttributeRule("service.name", "critical", "Service identity — required for Log Observer service filter and Related Content", related_content=True),
-    AttributeRule("deployment.environment", "critical", "Environment scoping — required for Related Content", related_content=True),
+    AttributeRule("deployment.environment", "critical", "Environment scoping — required for Related Content", related_content=True, alternatives=["sf_environment"]),
     AttributeRule("trace_id", "warning", "APM ↔ Logs correlation — enables trace-to-log linking", related_content=True, alternatives=["traceId", "trace.id"]),
     AttributeRule("span_id", "warning", "Span-level log correlation", related_content=True, alternatives=["spanId", "span.id"]),
     AttributeRule("host.name", "warning", "Host-level log aggregation and IM correlation", related_content=True, alternatives=["host", "hostname"]),
@@ -102,7 +102,7 @@ LOGS_RULES: list[AttributeRule] = [
 # Log Observer Connect (LOC) specific — Splunk Platform logs linked to O11y
 LOC_RULES: list[AttributeRule] = [
     AttributeRule("service.name", "critical", "Required for LOC service correlation"),
-    AttributeRule("deployment.environment", "critical", "Required for LOC environment scoping"),
+    AttributeRule("deployment.environment", "critical", "Required for LOC environment scoping", alternatives=["sf_environment"]),
     AttributeRule("trace_id", "warning", "Required for APM ↔ LOC trace linking", alternatives=["traceId"]),
     AttributeRule("span_id", "warning", "Required for APM ↔ LOC span linking", alternatives=["spanId"]),
     AttributeRule("host", "warning", "Required for LOC ↔ IM host correlation", alternatives=["host.name", "hostname"]),

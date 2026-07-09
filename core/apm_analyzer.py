@@ -10,6 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from .schema import APM_RULES, APM_TO_IM_LINK_ATTRS, APM_TO_LOGS_LINK_ATTRS, AttributeRule
@@ -30,6 +31,8 @@ def _gql_post(app_base: str, token: str, op: str, body: dict) -> dict:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"HTTP {e.code}: {(e.read() or b'')[:300].decode()}")
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"Request failed: {e}")
 
 
 def _search_traces(
@@ -145,13 +148,16 @@ def analyze_apm(
             "score": 0,
         }
 
-    # Fetch full span details for each trace (cap at 20 to avoid rate limits)
+    # Fetch full span details for all traces in parallel
     all_spans: list[dict[str, str]] = []
     services_seen: set[str] = set()
     environments_seen: set[str] = set()
 
-    for trace_id in trace_ids[:20]:
-        for span in _get_trace_full(app_base, token, trace_id):
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        span_batches = list(ex.map(lambda tid: _get_trace_full(app_base, token, tid), trace_ids))
+
+    for spans in span_batches:
+        for span in spans:
             attrs = _collect_span_attrs(span)
             all_spans.append(attrs)
             if svc := attrs.get("service.name"):

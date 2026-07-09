@@ -87,6 +87,24 @@
   .tab-content { display: none; }
   .tab-content.active { display: block; }
   .summary-text { color: var(--muted); font-size: 0.9rem; margin-bottom: 16px; font-style: italic; }
+  .env-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-bottom: 24px; }
+  .env-table th { background: rgba(255,255,255,0.04); padding: 8px 12px; text-align: left;
+    font-weight: 600; font-size: 0.75rem; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.04em; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; }
+  .env-table th:hover { color: var(--text); }
+  .env-table td { padding: 8px 12px; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  .env-table tr:last-child td { border-bottom: none; }
+  .env-table tr:hover td { background: rgba(255,255,255,0.02); }
+  details { margin-bottom: 8px; }
+  details summary { cursor: pointer; padding: 10px 14px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 6px; font-size: 0.88rem;
+    list-style: none; display: flex; align-items: center; gap: 10px; }
+  details summary::-webkit-details-marker { display: none; }
+  details[open] summary { border-radius: 6px 6px 0 0; border-bottom-color: transparent; }
+  details .env-detail { background: var(--surface); border: 1px solid var(--border);
+    border-top: none; border-radius: 0 0 6px 6px; padding: 16px; }
+  .score-pill { display: inline-block; font-size: 0.78rem; font-weight: 700;
+    padding: 2px 8px; border-radius: 10px; min-width: 38px; text-align: center; }
 </style>
 </head>
 <body>
@@ -102,15 +120,33 @@
 <h2>Top Recommendations</h2>
 <ul class="recs" id="recs"></ul>
 
-<h2>Signal Details</h2>
-<div class="tabs">
-  <div class="tab active" onclick="showTab('apm')">APM</div>
-  <div class="tab" onclick="showTab('metrics')">Infrastructure Metrics</div>
-  <div class="tab" onclick="showTab('logs')">Logs</div>
+<div id="env-breakdown-section">
+  <h2>Environment Breakdown</h2>
+  <table class="env-table" id="env-table">
+    <thead><tr>
+      <th onclick="sortEnvTable(0)">Environment</th>
+      <th onclick="sortEnvTable(1)">APM</th>
+      <th onclick="sortEnvTable(2)">Metrics</th>
+      <th onclick="sortEnvTable(3)">Logs</th>
+      <th onclick="sortEnvTable(4)">Combined</th>
+      <th onclick="sortEnvTable(5)">RC Status</th>
+    </tr></thead>
+    <tbody id="env-table-body"></tbody>
+  </table>
+  <div id="env-details"></div>
 </div>
-<div id="apm" class="tab-content active"></div>
-<div id="metrics" class="tab-content"></div>
-<div id="logs" class="tab-content"></div>
+
+<div id="single-signal-section">
+  <h2>Signal Details</h2>
+  <div class="tabs">
+    <div class="tab active" onclick="showTab('apm')">APM</div>
+    <div class="tab" onclick="showTab('metrics')">Infrastructure Metrics</div>
+    <div class="tab" onclick="showTab('logs')">Logs</div>
+  </div>
+  <div id="apm" class="tab-content active"></div>
+  <div id="metrics" class="tab-content"></div>
+  <div id="logs" class="tab-content"></div>
+</div>
 
 <script>
 const REPORT = __REPORT_JSON__;
@@ -129,6 +165,166 @@ function badge(status) {
 function pctBar(pct, severity) {
   const cls = severity==='critical'?'pct-fill-crit':severity==='warning'?'pct-fill-warn':'pct-fill-ok';
   return `<div class="pct-bar"><div class="pct-track"><div class="${cls}" style="width:${pct}%"></div></div><span>${pct}%</span></div>`;
+}
+
+function scorePill(s) {
+  const color = s >= 80 ? 'var(--ok)' : s >= 50 ? 'var(--warn)' : 'var(--crit)';
+  return `<span class="score-pill" style="background:${color}22;color:${color};border:1px solid ${color}55">${s}</span>`;
+}
+
+let _envSortCol = 4, _envSortAsc = false;
+
+function sortEnvTable(col) {
+  if (_envSortCol === col) { _envSortAsc = !_envSortAsc; } else { _envSortCol = col; _envSortAsc = col === 0; }
+  renderEnvTable(REPORT.per_environment || []);
+}
+
+function showEnvTab(envIdx, signal) {
+  ['apm','metrics','logs'].forEach(s => {
+    document.getElementById(`${s}-env-${envIdx}`)?.classList.toggle('active', s === signal);
+  });
+  document.getElementById(`env-detail-${envIdx}`)?.querySelectorAll('.env-tab').forEach((t, i) => {
+    t.classList.toggle('active', ['apm','metrics','logs'][i] === signal);
+  });
+}
+
+function renderEnvBreakdown(perEnv) {
+  if (!perEnv || !perEnv.length) {
+    document.getElementById('env-breakdown-section').style.display = 'none';
+    return;
+  }
+  // In breakdown mode: hide single-signal section and generic RC/recs
+  document.getElementById('single-signal-section').style.display = 'none';
+  document.getElementById('rc-links').innerHTML = '';
+  document.getElementById('rc-links').previousElementSibling?.remove(); // "Related Content Link Status" h2
+  document.getElementById('recs').innerHTML = '';
+  document.getElementById('recs').previousElementSibling?.remove(); // "Top Recommendations" h2
+
+  // Summary cards — aggregate stats across all environments
+  const total = perEnv.length;
+  const nBroken = perEnv.filter(e => e.correlation?.overall_status === 'broken').length;
+  const nPartial = perEnv.filter(e => e.correlation?.overall_status === 'partial').length;
+  const nOk = perEnv.filter(e => e.correlation?.overall_status === 'ok').length;
+  const avgCombined = Math.round(perEnv.reduce((s,e) => s+(e.correlation?.combined_score??0),0)/total);
+  const avgApm = Math.round(perEnv.reduce((s,e) => s+(e.apm?.score??0),0)/total);
+  const avgMet = Math.round(perEnv.reduce((s,e) => s+(e.metrics?.score??0),0)/total);
+  const avgLog = Math.round(perEnv.reduce((s,e) => s+(e.logs?.score??0),0)/total);
+  const activeEnvs = perEnv.filter(e => (e.apm?.spans_sampled||0)+(e.metrics?.mts_sampled||0) > 0).length;
+
+  document.getElementById('score-cards').innerHTML = `
+    <div class="card">
+      <div class="label">Environments</div>
+      <div class="value">${total}</div>
+      <div class="sub">${activeEnvs} with active telemetry</div>
+    </div>
+    <div class="card">
+      <div class="label">RC Status</div>
+      <div class="value"><span class="ok">${nOk}</span> / <span class="warn">${nPartial}</span> / <span class="crit">${nBroken}</span></div>
+      <div class="sub">OK / Partial / Broken</div>
+    </div>
+    <div class="card">
+      <div class="label">Avg Combined Score</div>
+      <div class="value" style="color:${scoreColor(avgCombined)}">${avgCombined}<span style="font-size:1rem;color:var(--muted)">/100</span></div>
+      <div class="score-bar"><div class="score-fill" style="width:${avgCombined}%;background:${scoreColor(avgCombined)}"></div></div>
+    </div>
+    <div class="card">
+      <div class="label">Avg APM Score</div>
+      <div class="value" style="color:${scoreColor(avgApm)}">${avgApm}<span style="font-size:1rem;color:var(--muted)">/100</span></div>
+      <div class="score-bar"><div class="score-fill" style="width:${avgApm}%;background:${scoreColor(avgApm)}"></div></div>
+    </div>
+    <div class="card">
+      <div class="label">Avg Metrics Score</div>
+      <div class="value" style="color:${scoreColor(avgMet)}">${avgMet}<span style="font-size:1rem;color:var(--muted)">/100</span></div>
+      <div class="score-bar"><div class="score-fill" style="width:${avgMet}%;background:${scoreColor(avgMet)}"></div></div>
+    </div>
+    <div class="card">
+      <div class="label">Avg Logs Score</div>
+      <div class="value" style="color:${scoreColor(avgLog)}">${avgLog}<span style="font-size:1rem;color:var(--muted)">/100</span></div>
+      <div class="score-bar"><div class="score-fill" style="width:${avgLog}%;background:${scoreColor(avgLog)}"></div></div>
+    </div>
+  `;
+
+  renderEnvTable(perEnv);
+
+  // Per-env accordions with full signal detail tabs
+  const detailsEl = document.getElementById('env-details');
+  detailsEl.innerHTML = perEnv.map((e, i) => {
+    const cor = e.correlation || {};
+    const overall = cor.overall_status || 'unknown';
+    const score = cor.combined_score || 0;
+    const apmS = e.apm?.score ?? 0;
+    const metS = e.metrics?.score ?? 0;
+    const logS = e.logs?.score ?? 0;
+
+    const links = (cor.links || []).map(l => {
+      const icon = l.status==='ok'?'✓':l.status==='partial'?'⚠':'✗';
+      const cls = l.status==='ok'?'ok':l.status==='partial'?'warn':'crit';
+      const impact = l.impact ? `<div class="impact-box" style="margin-top:4px">${l.impact}</div>` : '';
+      const fix = l.fix ? `<div class="fix-box" style="margin-top:4px">${l.fix}</div>` : '';
+      return `<div class="link-card ${l.status}" style="margin-bottom:8px">
+        <div class="link-title"><h3>${l.link}</h3>${badge(l.status)}</div>
+        <div class="conditions">${(l.conditions||[]).map(c=>`<div class="cond ${c.pass?'cond-pass':'cond-fail'}">${c.pass?'✓':'✗'} ${c.check}</div>`).join('')}</div>
+        ${impact}${fix}
+      </div>`;
+    }).join('');
+
+    return `<details id="envdetails-${i}">
+      <summary>
+        ${badge(overall)}
+        <code style="font-size:0.95rem">${e.environment}</code>
+        <span style="margin-left:8px;color:var(--muted);font-size:0.78rem">
+          APM ${scorePill(apmS)} Metrics ${scorePill(metS)} Logs ${scorePill(logS)} Combined ${scorePill(score)}
+        </span>
+      </summary>
+      <div class="env-detail" id="env-detail-${i}">
+        <h3>Related Content Links</h3>
+        <div style="margin-bottom:16px">${links || '<p style="color:var(--muted)">No link data.</p>'}</div>
+        <h3>Signal Details</h3>
+        <div class="tabs" style="margin-top:8px">
+          <div class="tab env-tab active" onclick="showEnvTab(${i},'apm')">APM</div>
+          <div class="tab env-tab" onclick="showEnvTab(${i},'metrics')">Infrastructure Metrics</div>
+          <div class="tab env-tab" onclick="showEnvTab(${i},'logs')">Logs</div>
+        </div>
+        <div id="apm-env-${i}" class="tab-content active"></div>
+        <div id="metrics-env-${i}" class="tab-content"></div>
+        <div id="logs-env-${i}" class="tab-content"></div>
+      </div>
+    </details>`;
+  }).join('');
+
+  // Populate signal tabs for each environment
+  perEnv.forEach((e, i) => {
+    renderSignal(`apm-env-${i}`, e.apm||{}, 'attribute', 'spans_sampled');
+    renderSignal(`metrics-env-${i}`, e.metrics||{}, 'dimension', 'mts_sampled');
+    renderSignal(`logs-env-${i}`, e.logs||{}, 'field', 'logs_sampled');
+  });
+}
+
+function renderEnvTable(perEnv) {
+  const statusOrder = {ok:0, partial:1, broken:2, unknown:3};
+  const sorted = [...perEnv].sort((a, b) => {
+    let av, bv;
+    if (_envSortCol === 0) { av = a.environment; bv = b.environment; }
+    else if (_envSortCol === 1) { av = a.apm?.score ?? 0; bv = b.apm?.score ?? 0; }
+    else if (_envSortCol === 2) { av = a.metrics?.score ?? 0; bv = b.metrics?.score ?? 0; }
+    else if (_envSortCol === 3) { av = a.logs?.score ?? 0; bv = b.logs?.score ?? 0; }
+    else if (_envSortCol === 4) { av = a.correlation?.combined_score ?? 0; bv = b.correlation?.combined_score ?? 0; }
+    else { av = statusOrder[a.correlation?.overall_status] ?? 9; bv = statusOrder[b.correlation?.overall_status] ?? 9; }
+    if (av < bv) return _envSortAsc ? -1 : 1;
+    if (av > bv) return _envSortAsc ? 1 : -1;
+    return 0;
+  });
+  document.getElementById('env-table-body').innerHTML = sorted.map(e => {
+    const cor = e.correlation || {};
+    return `<tr>
+      <td><code>${e.environment}</code></td>
+      <td>${scorePill(e.apm?.score ?? 0)}</td>
+      <td>${scorePill(e.metrics?.score ?? 0)}</td>
+      <td>${scorePill(e.logs?.score ?? 0)}</td>
+      <td>${scorePill(cor.combined_score ?? 0)}</td>
+      <td>${badge(cor.overall_status || 'unknown')}</td>
+    </tr>`;
+  }).join('');
 }
 
 function init() {
@@ -208,7 +404,8 @@ function init() {
   ).join('');
   document.getElementById('recs').innerHTML = recsHtml || '<li style="color:var(--muted)">No recommendations — instrumentation looks good!</li>';
 
-  // Signal sections
+  // Environment breakdown or signal details
+  renderEnvBreakdown(REPORT.per_environment);
   renderSignal('apm', REPORT.apm||{}, 'attribute', 'spans_sampled');
   renderSignal('metrics', REPORT.metrics||{}, 'dimension', 'mts_sampled');
   renderSignal('logs', REPORT.logs||{}, 'field', 'logs_sampled');
@@ -223,8 +420,9 @@ function renderSignal(id, result, keyName, countKey) {
   }
 
   const sampled = result[countKey] || result.traces_sampled || 0;
+  const sampledLabel = result.check_mode === 'existence' ? 'all (existence checks)' : sampled.toLocaleString();
   let metaItems = [`<span>Score: <strong style="color:${scoreColor(result.score||0)}">${result.score||0}/100</strong></span>`,
-                   `<span>Sampled: <strong>${sampled.toLocaleString()}</strong></span>`];
+                   `<span>Coverage: <strong>${sampledLabel}</strong></span>`];
   if (result.services_seen?.length) metaItems.push(`<span>Services: ${result.services_seen.slice(0,5).join(', ')}</span>`);
   if (result.environments_seen?.length) metaItems.push(`<span>Envs: ${result.environments_seen.join(', ')}</span>`);
   if (result.mode_description) metaItems.push(`<span>Mode: ${result.mode_description}</span>`);

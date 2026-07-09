@@ -70,10 +70,15 @@ def render_markdown(report: dict[str, Any]) -> str:
             lines.append(f"{rec['priority']}. **{sev_label} {rec['link']}** — {rec['recommendation']}")
         lines.append("")
 
-    # ── Per-signal sections ───────────────────────────────────────────────────
-    lines += _markdown_signal_section("APM", apm, "attribute", "spans_sampled")
-    lines += _markdown_signal_section("Infrastructure Metrics", metrics, "dimension", "mts_sampled")
-    lines += _markdown_signal_section("Logs", logs, "field", "logs_sampled")
+    # ── Per-environment breakdown ─────────────────────────────────────────────
+    per_env = report.get("per_environment")
+    if per_env:
+        lines += _markdown_env_breakdown(per_env)
+    else:
+        # ── Per-signal sections ───────────────────────────────────────────────
+        lines += _markdown_signal_section("APM", apm, "attribute", "spans_sampled")
+        lines += _markdown_signal_section("Infrastructure Metrics", metrics, "dimension", "mts_sampled")
+        lines += _markdown_signal_section("Logs", logs, "field", "logs_sampled")
 
     return "\n".join(lines)
 
@@ -135,6 +140,52 @@ def _markdown_signal_section(title: str, result: dict, key_name: str, count_key:
     return lines
 
 
+def _markdown_env_breakdown(per_env: list[dict]) -> list[str]:
+    lines: list[str] = ["## Environment Breakdown", ""]
+
+    # Summary table
+    lines.append("| Environment | APM | Metrics | Logs | Combined | RC Status |")
+    lines.append("|---|---|---|---|---|---|")
+    for e in per_env:
+        env = e["environment"]
+        apm_s = e["apm"].get("score", 0)
+        met_s = e["metrics"].get("score", 0)
+        log_s = e["logs"].get("score", 0)
+        combined = e["correlation"].get("combined_score", 0)
+        status = e["correlation"].get("overall_status", "unknown")
+        lines.append(f"| `{env}` | {apm_s} | {met_s} | {log_s} | {combined} | {status.upper()} |")
+    lines.append("")
+
+    # Per-environment detail sections
+    for e in per_env:
+        env = e["environment"]
+        cor = e["correlation"]
+        overall = cor.get("overall_status", "unknown")
+        score = cor.get("combined_score", 0)
+        lines += [f"### `{env}` — {overall.upper()} ({score}/100)", ""]
+
+        # RC link status
+        for link in cor.get("links", []):
+            icon = "✓" if link["status"] == "ok" else ("⚠" if link["status"] == "partial" else "✗")
+            lines.append(f"- {icon} **{link['link']}**: `{link['status'].upper()}`"
+                         + (f" — {link['impact']}" if link.get("impact") else ""))
+        lines.append("")
+
+        # Top critical findings across signals
+        critical = []
+        for signal_key, label in [("apm", "APM"), ("metrics", "Metrics"), ("logs", "Logs")]:
+            for f in e[signal_key].get("findings", []):
+                if f.get("severity") == "critical" and f.get("status") == "missing":
+                    attr = f.get("attribute") or f.get("dimension") or f.get("field", "")
+                    critical.append(f"  - [{label}] `{attr}` missing")
+        if critical:
+            lines.append("**Critical gaps:**")
+            lines += critical
+            lines.append("")
+
+    return lines
+
+
 def _score_bar(score: int) -> str:
     filled = round(score / 10)
     return "█" * filled + "░" * (10 - filled)
@@ -171,17 +222,22 @@ def build_report(
     correlation_result: dict[str, Any],
     service: str | None = None,
     environment: str | None = None,
+    per_env_results: list[dict] | None = None,
 ) -> dict[str, Any]:
-    return {
+    report: dict[str, Any] = {
         "meta": {
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "realm": realm,
             "service": service,
             "environment": environment,
             "tool": "o11y-instrumentation-analyzer",
+            "breakdown_by_env": per_env_results is not None,
         },
         "correlation": correlation_result,
         "apm": apm_result,
         "metrics": metrics_result,
         "logs": logs_result,
     }
+    if per_env_results is not None:
+        report["per_environment"] = per_env_results
+    return report

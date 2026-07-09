@@ -9,6 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from .schema import METRICS_RULES, IM_TO_APM_LINK_DIMS, SERVICE_CENTRIC_REQUIREMENTS
@@ -21,10 +22,12 @@ def _api_get(api_base: str, token: str, path: str, params: dict | None = None) -
     url = f"{api_base}{path}" + (f"?{qs}" if qs else "")
     req = urllib.request.Request(url, headers={"X-SF-Token": token, "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"HTTP {e.code}: {(e.read() or b'')[:300].decode()}")
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"Request failed: {e}")
 
 
 def _sample_mts(
@@ -34,22 +37,97 @@ def _sample_mts(
     environment: str | None = None,
     limit: int = 200,
 ) -> list[dict]:
-    """Sample active MTS from the catalog, optionally scoped to service/env."""
-    filters = []
-    if service:
-        filters.append(f'sf_service:"{service}"')
-    if environment:
-        filters.append(f'sf_environment:"{environment}" OR deployment.environment:"{environment}" OR k8s.cluster.name:"{environment}"')
+    """Sample active MTS from the catalog, optionally scoped to service/env.
 
-    query = " AND ".join(filters)
-    try:
-        data = _api_get(api_base, token, "/v2/metrictimeseries", {
-            "query": query, "limit": limit,
-        })
+    Runs two queries and merges results to avoid sampling bias: unfiltered APIs
+    tend to return the most-numerous metric type first (e.g. process metrics),
+    which can crowd out k8s metrics entirely in the sample.
+    """
+    # Build base query — try deployment.environment first (OTel convention),
+    # fall back to sf_environment if no results. Using OR causes slow full-scans.
+    def _make_filters(env_field: str) -> list[str]:
+        f = []
+        if service:
+            f.append(f'sf_service:"{service}"')
+        if environment:
+            f.append(f'{env_field}:"{environment}"')
+        return f
+
+    def _query_mts(filters: list[str], lim: int) -> list[dict]:
+        q = " AND ".join(filters)
+        data = _api_get(api_base, token, "/v2/metrictimeseries", {"query": q, "limit": lim})
         return data.get("results") or []
+
+    # General sample — majority of the budget
+    general_limit = limit * 3 // 4
+    results: list[dict] = []
+    try:
+        results = _query_mts(_make_filters("deployment.environment"), general_limit)
+        # If no results with OTel convention, retry with sf_environment
+        if not results and environment:
+            results = _query_mts(_make_filters("sf_environment"), general_limit)
     except RuntimeError as e:
         logger.warning("MTS catalog query failed: %s", e)
-        return []
+
+    # K8s-targeted sample — ensures k8s dimensions aren't crowded out
+    k8s_limit = limit - len(results)
+    if k8s_limit > 0:
+        k8s_filters = _make_filters("deployment.environment") + ["k8s.cluster.name:*"]
+        try:
+            k8s_results = _query_mts(k8s_filters, k8s_limit)
+            seen_ids = {m["id"] for m in results if m.get("id")}
+            results += [m for m in k8s_results if m.get("id") not in seen_ids]
+        except RuntimeError as e:
+            logger.debug("K8s MTS query failed (may not have k8s metrics): %s", e)
+
+    return results
+
+
+def _dim_exists(
+    api_base: str,
+    token: str,
+    dim: str,
+    service: str | None,
+    environment: str | None,
+) -> bool:
+    """Return True if any active MTS carries this dimension."""
+    base: list[str] = [f"{dim}:*"]
+    if service:
+        base.append(f'sf_service:"{service}"')
+
+    env_fields = []
+    if environment:
+        env_fields = ["deployment.environment", "sf_environment"]
+
+    if env_fields:
+        for env_field in env_fields:
+            q = " AND ".join(base + [f'{env_field}:"{environment}"'])
+            try:
+                data = _api_get(api_base, token, "/v2/metrictimeseries", {"query": q, "limit": 1})
+                if data.get("results"):
+                    return True
+            except RuntimeError:
+                pass
+    else:
+        q = " AND ".join(base)
+        try:
+            data = _api_get(api_base, token, "/v2/metrictimeseries", {"query": q, "limit": 1})
+            if data.get("results"):
+                return True
+        except RuntimeError:
+            pass
+    return False
+
+
+def _any_dim_exists(
+    api_base: str,
+    token: str,
+    dims: list[str],
+    service: str | None,
+    environment: str | None,
+) -> bool:
+    """Return True if any candidate dimension exists on at least one active MTS."""
+    return any(_dim_exists(api_base, token, d, service, environment) for d in dims)
 
 
 def _sample_metrics_usage(api_base: str, token: str, lookback: str = "P1D") -> list[dict]:
@@ -65,26 +143,34 @@ def _sample_metrics_usage(api_base: str, token: str, lookback: str = "P1D") -> l
 
 
 def _check_runtime_metrics(api_base: str, token: str, service: str | None, environment: str | None) -> dict:
-    """Check whether expected runtime metrics exist for the service."""
+    """Check whether expected runtime metrics exist for the service (parallel per metric)."""
     results: dict[str, Any] = {}
-    for runtime, metric_names in SERVICE_CENTRIC_REQUIREMENTS["runtime_metrics"]["expected_metrics"].items():
-        found = []
-        missing = []
-        for metric in metric_names:
-            filters = [f"sf_metric:{metric}"]
-            if service:
-                filters.append(f'sf_service:"{service}"')
-            try:
-                data = _api_get(api_base, token, "/v2/metrictimeseries", {
-                    "query": " AND ".join(filters), "limit": 1,
-                })
-                if data.get("results"):
-                    found.append(metric)
-                else:
-                    missing.append(metric)
-            except RuntimeError:
-                missing.append(metric)
-        results[runtime] = {"found": found, "missing": missing}
+
+    def _probe(metric: str) -> bool:
+        filters = [f"sf_metric:{metric}"]
+        if service:
+            filters.append(f'sf_service:"{service}"')
+        try:
+            data = _api_get(api_base, token, "/v2/metrictimeseries", {
+                "query": " AND ".join(filters), "limit": 1,
+            })
+            return bool(data.get("results"))
+        except RuntimeError:
+            return False
+
+    all_metrics = [
+        (runtime, metric)
+        for runtime, names in SERVICE_CENTRIC_REQUIREMENTS["runtime_metrics"]["expected_metrics"].items()
+        for metric in names
+    ]
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        probe_results = list(ex.map(lambda t: (t[0], t[1], _probe(t[1])), all_metrics))
+
+    for runtime, metric, found in probe_results:
+        bucket = results.setdefault(runtime, {"found": [], "missing": []})
+        (bucket["found"] if found else bucket["missing"]).append(metric)
+
     return results
 
 
@@ -97,91 +183,91 @@ def analyze_metrics(
     sample_size: int = 200,
 ) -> dict[str, Any]:
     """
-    Sample MTS catalog and check for missing dimensions.
+    Check for missing dimensions across all active MTS using per-dimension
+    existence queries, avoiding sampling bias. A small sample is still fetched
+    for metric name / namespace metadata only.
     """
     api_base = f"https://api.{realm}.signalfx.com"
-    logger.info("Metrics: sampling MTS catalog (service=%s, env=%s)", service, environment)
+    logger.info("Metrics: checking dimensions across all active MTS (service=%s, env=%s)", service, environment)
 
-    mts_list = _sample_mts(api_base, token, service, environment, limit=sample_size)
-
-    if not mts_list:
-        return {
-            "error": None,
-            "mts_sampled": 0,
-            "findings": [{"rule": "no_data", "severity": "warning",
-                          "message": "No active MTS found matching the filter. "
-                                     "Check that metrics are actively ingesting."}],
-            "score": 0,
-        }
-
-    total = len(mts_list)
-    logger.info("Metrics: sampled %d MTS", total)
-
-    # Count presence of each dimension across sampled MTS
-    dim_presence: dict[str, int] = defaultdict(int)
+    # Small sample for metadata (metric names, namespaces) only
+    meta_sample = _sample_mts(api_base, token, service, environment, limit=50)
     metric_names_seen: set[str] = set()
     namespaces_seen: set[str] = set()
-
-    for mts in mts_list:
+    for mts in meta_sample:
         dims = mts.get("dimensions") or {}
-        for rule in METRICS_RULES:
-            candidates = [rule.name] + rule.alternatives
-            if any(dims.get(c) for c in candidates):
-                dim_presence[rule.name] += 1
         if mn := (mts.get("metric") or mts.get("name")):
             metric_names_seen.add(str(mn))
         if ns := dims.get("namespace"):
             namespaces_seen.add(str(ns))
 
-    # Build findings
+    # Verify org/env actually has metrics before running per-dimension checks
+    if not meta_sample:
+        # Try a completely unfiltered check to distinguish no-env-data vs no-metrics
+        env_probe_filters: list[str] = []
+        if service:
+            env_probe_filters.append(f'sf_service:"{service}"')
+        probe_q = " AND ".join(env_probe_filters) if env_probe_filters else ""
+        try:
+            probe = _api_get(api_base, token, "/v2/metrictimeseries",
+                             {"query": probe_q or "*", "limit": 1})
+        except RuntimeError:
+            probe = {}
+        if not probe.get("results"):
+            return {
+                "error": None,
+                "mts_sampled": 0,
+                "findings": [{"rule": "no_data", "severity": "warning",
+                              "message": "No active MTS found matching the filter. "
+                                         "Check that metrics are actively ingesting."}],
+                "score": 0,
+            }
+
+    # Per-dimension existence check across ALL active MTS — run all rules in parallel
+    logger.info("Metrics: running per-dimension existence checks for %d rules", len(METRICS_RULES))
+    dim_present: dict[str, bool] = {}
+
+    def _check_rule(rule: Any) -> tuple:
+        candidates = [rule.name] + rule.alternatives
+        found = _any_dim_exists(api_base, token, candidates, service, environment)
+        logger.debug("Metrics: %s → %s", rule.name, "found" if found else "missing")
+        return rule.name, found
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for name, found in ex.map(_check_rule, METRICS_RULES):
+            dim_present[name] = found
+
+    # Build findings — binary present/missing (no sampling bias)
     findings: list[dict] = []
     for rule in METRICS_RULES:
-        present = dim_presence[rule.name]
-        pct = round(present / total * 100, 1)
-        missing_pct = 100 - pct
-
-        if missing_pct == 0:
+        if dim_present[rule.name]:
             continue
-
-        if missing_pct == 100:
-            sev = rule.severity
-            status = "missing"
-        elif missing_pct >= 50:
-            sev = rule.severity
-            status = "partial"
-        else:
-            sev = "info"
-            status = "partial"
-
         findings.append({
             "dimension": rule.name,
             "alternatives_checked": rule.alternatives,
-            "status": status,
-            "severity": sev,
-            "present_pct": pct,
-            "missing_pct": missing_pct,
-            "mts_checked": total,
+            "status": "missing",
+            "severity": rule.severity,
+            "present_pct": 0,
+            "missing_pct": 100,
+            "mts_checked": "all",
             "related_content": rule.related_content,
             "purpose": rule.purpose,
         })
 
-    # Related Content gap check
-    rc_gaps = _check_rc_gaps_metrics(dim_presence, total)
+    # dim_presence with total=1 for RC/service-centric gap checks (binary: 1=present, 0=missing)
+    dim_presence: dict[str, int] = {k: (1 if v else 0) for k, v in dim_present.items()}
 
-    # Runtime metrics presence
+    rc_gaps = _check_rc_gaps_metrics(dim_presence, 1)
     runtime_check = _check_runtime_metrics(api_base, token, service, environment)
-
-    # Service Centric view assessment
-    sc_gaps = _check_service_centric_gaps(dim_presence, total, runtime_check)
-
-    score = _compute_score(findings, total)
+    sc_gaps = _check_service_centric_gaps(dim_presence, 1, runtime_check)
+    score = _compute_score(findings, 1)
 
     return {
         "error": None,
-        "mts_sampled": total,
+        "mts_sampled": len(meta_sample),
         "metric_names_sample": sorted(metric_names_seen)[:20],
         "namespaces_seen": sorted(namespaces_seen),
-        "findings": sorted(findings, key=lambda f: ({"critical": 0, "warning": 1, "info": 2}[f["severity"]], -f["missing_pct"])),
+        "findings": sorted(findings, key=lambda f: {"critical": 0, "warning": 1, "info": 2}[f["severity"]]),
         "related_content_gaps": rc_gaps,
         "service_centric_gaps": sc_gaps,
         "runtime_metrics": runtime_check,

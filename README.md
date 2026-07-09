@@ -59,6 +59,38 @@ export SPLUNK_ACCESS_TOKEN=<your_token>
 python3 analyze.py --realm us0 --format json | jq .correlation
 ```
 
+### Per-environment breakdown
+
+Run the analysis across multiple environments and get a consolidated HTML report with
+a summary table and per-environment drill-down (RC link status, APM/Metrics/Logs scores).
+
+```bash
+# Target specific environments (recommended — faster, avoids analyzing stale/test envs)
+python3 analyze.py --realm us0 --token $TOKEN \
+  --environments prod,staging,dev \
+  --format html --output report.html
+
+# Auto-discover all environments in the org (capped at 20 by default)
+python3 analyze.py --realm us0 --token $TOKEN \
+  --breakdown-by-env \
+  --format html --output report.html
+
+# Auto-discover up to 50 environments
+python3 analyze.py --realm us0 --token $TOKEN \
+  --breakdown-by-env --max-environments 50 \
+  --format html --output report.html
+
+# Skip logs if Log Observer is not configured (speeds up each env)
+python3 analyze.py --realm us0 --token $TOKEN \
+  --environments prod,staging,dev \
+  --skip-logs \
+  --format html --output report.html
+```
+
+> **Performance:** Each environment takes ~30–60 seconds depending on API latency.
+> For 10 environments expect ~5–10 minutes; for 40 environments expect ~20–30 minutes.
+> Use `--environments` to target only the environments you care about.
+
 ## Output formats
 
 | Format | Description |
@@ -71,20 +103,38 @@ python3 analyze.py --realm us0 --format json | jq .correlation
 ## Options
 
 ```
---realm REALM              Splunk Observability realm (us0, us1, eu0, jp0, etc.)
---token TOKEN              API access token (or SPLUNK_ACCESS_TOKEN env var)
---service SERVICE          Scope to a specific service name
---environment ENV          Scope to a specific environment
---lookback-hours N         Lookback window in hours (default: 3)
---apm-sample-size N        Traces to sample for APM (default: 50)
---metrics-sample-size N    MTS to sample for metrics (default: 200)
---logs-sample-size N       Log records to sample (default: 100)
---skip-apm                 Skip APM trace analysis
---skip-metrics             Skip infrastructure metrics analysis
---skip-logs                Skip log analysis
---format {md,json,html,all} Output format (default: md)
---output PATH              Output file or directory (default: stdout)
---verbose                  Enable verbose logging
+Connection:
+  --realm REALM              Splunk Observability realm (us0, us1, eu0, jp0, etc.)
+  --token TOKEN              API access token (or SPLUNK_ACCESS_TOKEN env var)
+
+Scope:
+  --service SERVICE          Scope to a specific service name
+  --environment ENV          Scope to a specific environment
+  --lookback-hours N         Lookback window in hours (default: 3)
+
+Sampling:
+  --apm-sample-size N        Traces to sample for APM (default: 50)
+  --metrics-sample-size N    MTS to sample for metrics metadata (default: 200)
+  --logs-sample-size N       Log records to sample (default: 100)
+
+Signals:
+  --skip-apm                 Skip APM trace analysis
+  --skip-metrics             Skip infrastructure metrics analysis
+  --skip-logs                Skip log analysis
+
+Output:
+  --format {md,json,html,all} Output format (default: md)
+  --output PATH              Output file or directory (default: stdout)
+
+Environment breakdown:
+  --environments ENV[,ENV…]  Comma-separated list of environments to analyze.
+                             Produces a per-environment breakdown report.
+                             Implies --breakdown-by-env.
+  --breakdown-by-env         Auto-discover environments and analyze each one.
+  --max-environments N       Cap on auto-discovered environments (default: 20)
+
+Misc:
+  --verbose                  Enable verbose logging
 ```
 
 ## Exit codes
@@ -112,12 +162,13 @@ coverage weighted by severity:
 analyze.py              CLI entry point
 core/
   schema.py             Attribute rule definitions (APM, Metrics, Logs, LOC)
-  apm_analyzer.py       Trace sampling via GraphQL Trace Analytics API
-  metrics_analyzer.py   MTS catalog sampling via /v2/metrictimeseries
+  apm_analyzer.py       Trace sampling via GraphQL Trace Analytics API (parallel fetch)
+  metrics_analyzer.py   Per-dimension existence checks via /v2/metrictimeseries (parallel)
   logs_analyzer.py      Log sampling via /v1/log/search, Unified + LOC detection
   correlation_checker.py  Cross-signal Related Content link validation
+  env_discovery.py      Environment discovery via /v2/dimension, junk filtering
 report/
   renderer.py           Markdown / JSON / HTML output renderers
   templates/
-    report.html         Interactive HTML report template
+    report.html         Interactive HTML report template (breakdown + single-env modes)
 ```
