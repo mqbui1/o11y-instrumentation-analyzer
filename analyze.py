@@ -88,7 +88,13 @@ def parse_args() -> argparse.Namespace:
                           "Create in Splunk Platform: Settings → Tokens. "
                           "(or set SPLUNK_PLATFORM_TOKEN env var)")
     loc.add_argument("--splunk-index", default="*", metavar="INDEX",
-                     help="Splunk index to search for logs (default: * = all accessible)")
+                     help="Splunk index to search for logs (default: * = all accessible). "
+                          "Used as fallback when --splunk-index-map has no entry for an environment.")
+    loc.add_argument("--splunk-index-map", default=None, metavar="MAP",
+                     help="Map deployment.environment values to Splunk indexes. "
+                          "Format: env1=index1,env2=index2  "
+                          "e.g. prod=tiaa_prod_logs,dev=tiaa_dev_logs,staging=tiaa_staging_logs. "
+                          "Environments not in the map fall back to --splunk-index.")
     loc.add_argument("--no-verify-ssl", action="store_true",
                      help="Disable SSL certificate verification for Splunk Platform "
                           "(use for self-signed certs in Splunk Enterprise)")
@@ -114,6 +120,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
 
     return parser.parse_args()
+
+
+def _parse_index_map(raw: str | None) -> dict[str, str]:
+    """Parse 'env1=idx1,env2=idx2' into {env: index} dict."""
+    if not raw:
+        return {}
+    result = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if "=" in pair:
+            env, _, idx = pair.partition("=")
+            result[env.strip()] = idx.strip()
+    return result
+
+
+def _resolve_splunk_index(args: argparse.Namespace, environment: str | None) -> str:
+    """Return the Splunk index to use for this environment."""
+    index_map = _parse_index_map(args.splunk_index_map)
+    if environment and environment in index_map:
+        return index_map[environment]
+    return args.splunk_index
 
 
 def _empty_result(signal: str) -> dict:
@@ -222,7 +249,7 @@ def _run_signals(
             sample_size=args.logs_sample_size,
             splunk_url=args.splunk_url,
             splunk_token=args.splunk_token,
-            splunk_index=args.splunk_index,
+            splunk_index=_resolve_splunk_index(args, env),
             verify_ssl=not args.no_verify_ssl,
         )
         logs = logs_result.get("logs_sampled", 0)

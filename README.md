@@ -58,11 +58,19 @@ python3 analyze.py --realm us1 --token $TOKEN --format all --output ./reports/
 export SPLUNK_ACCESS_TOKEN=<your_token>
 python3 analyze.py --realm us0 --format json | jq .correlation
 
-# Include log analysis via Log Observer Connect (Splunk Platform)
+# Include log analysis via Log Observer Connect — single index
 python3 analyze.py --realm us0 --token $TOKEN \
   --splunk-url https://prd-p-<stack>.splunkcloud.com:8089 \
   --splunk-token $SPLUNK_PLATFORM_TOKEN \
   --splunk-index otel_logs \
+  --format html --output report.html
+
+# LOC with per-environment index mapping (different index per environment)
+python3 analyze.py --realm us0 --token $TOKEN \
+  --splunk-url https://prd-p-<stack>.splunkcloud.com:8089 \
+  --splunk-token $SPLUNK_PLATFORM_TOKEN \
+  --splunk-index-map "prod=tiaa_prod_logs,staging=tiaa_staging_logs,dev=tiaa_dev_logs" \
+  --environments prod,staging,dev \
   --format html --output report.html
 ```
 
@@ -136,7 +144,12 @@ Log Observer Connect (Splunk Platform):
   --splunk-token TOKEN       Splunk Platform Bearer token with search permissions.
                              Create in Splunk Platform: Settings → Tokens.
                              (or set SPLUNK_PLATFORM_TOKEN env var)
-  --splunk-index INDEX       Splunk index to search (default: * = all accessible)
+  --splunk-index INDEX       Splunk index to search (default: * = all accessible).
+                             Fallback when --splunk-index-map has no entry for an environment.
+  --splunk-index-map MAP     Map deployment.environment to Splunk indexes.
+                             Format: env1=index1,env2=index2
+                             e.g. prod=tiaa_prod_logs,dev=tiaa_dev_logs
+                             Environments not in the map fall back to --splunk-index.
   --no-verify-ssl            Disable SSL verification (Splunk Enterprise self-signed certs)
 
 Output:
