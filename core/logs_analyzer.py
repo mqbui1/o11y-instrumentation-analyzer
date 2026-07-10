@@ -55,7 +55,12 @@ def _splunk_export(
     }).encode("utf-8")
 
     req = urllib.request.Request(url, data=body, method="POST")
-    req.add_header("Authorization", f"Bearer {splunk_token}")
+    # Splunk Cloud uses Bearer tokens; some Splunk Enterprise setups use "Splunk <token>"
+    auth_header = (
+        splunk_token if splunk_token.startswith("Bearer ") or splunk_token.startswith("Splunk ")
+        else f"Bearer {splunk_token}"
+    )
+    req.add_header("Authorization", auth_header)
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
     ctx = ssl.create_default_context()
@@ -104,7 +109,9 @@ def _build_spl(
             f"('deployment.environment'=\"{environment}\" OR sf_environment=\"{environment}\")"
         )
 
-    return "search " + " ".join(filters) + f" | head {limit}"
+    # | spath extracts JSON fields from _raw — handles OTel logs stored as JSON blobs
+    # without pre-configured field extractions in Splunk
+    return "search " + " ".join(filters) + f" | head {limit} | spath input=_raw"
 
 
 def _extract_fields(record: dict) -> dict[str, str]:
