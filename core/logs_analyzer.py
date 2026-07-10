@@ -1,11 +1,23 @@
 """
-Logs analyzer — checks log fields for both Unified Identity (native O11y logs)
-and Log Observer Connect (Splunk Platform logs linked to O11y).
+Logs analyzer — queries Splunk Platform (Cloud or Enterprise) via the REST API
+to assess log field coverage for Log Observer Connect (LOC).
+
+LOC architecture:
+  Splunk Platform (Cloud/Enterprise) stores logs.
+  Splunk Observability Cloud queries them via LOC using a service account token.
+  There is no log storage in O11y itself — the /v1/log/search endpoint does not exist.
+
+Required inputs:
+  splunk_url   — Splunk Platform management endpoint, e.g.
+                 https://prd-p-<stack>.splunkcloud.com:8089
+  splunk_token — Splunk Platform Bearer token (Settings → Tokens in Splunk Platform)
+  splunk_index — index to search (default: *)
 """
 from __future__ import annotations
 
 import json
 import logging
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -13,115 +25,101 @@ import urllib.request
 from collections import defaultdict
 from typing import Any
 
-from .schema import LOGS_RULES, LOC_RULES
+from .schema import LOC_RULES
 
 logger = logging.getLogger(__name__)
 
-# Log Observer Connect detection heuristics
-_LOC_INDICATOR_FIELDS = {"index", "source", "sourcetype", "_raw", "punct", "linecount"}
+# Fields that indicate an event came from Splunk Platform (always present)
+_SPLUNK_NATIVE_FIELDS = {"_time", "_raw", "index", "source", "sourcetype", "host", "splunk_server"}
 
 
-def _api_post(api_base: str, token: str, path: str, body: dict) -> dict:
-    url = f"{api_base}{path}"
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"X-SF-Token": token, "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"HTTP {e.code}: {(e.read() or b'')[:300].decode()}")
-    except (urllib.error.URLError, OSError) as e:
-        raise RuntimeError(f"Request failed: {e}")
-
-
-def _api_get(api_base: str, token: str, path: str, params: dict | None = None) -> dict:
-    qs = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v is not None})
-    url = f"{api_base}{path}" + (f"?{qs}" if qs else "")
-    req = urllib.request.Request(url, headers={"X-SF-Token": token, "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"HTTP {e.code}: {(e.read() or b'')[:300].decode()}")
-    except (urllib.error.URLError, OSError) as e:
-        raise RuntimeError(f"Request failed: {e}")
-
-
-def _search_logs(
-    api_base: str,
-    token: str,
-    start_ms: int,
-    end_ms: int,
-    service: str | None = None,
-    environment: str | None = None,
+def _splunk_export(
+    splunk_url: str,
+    splunk_token: str,
+    spl: str,
     limit: int = 100,
+    verify_ssl: bool = True,
 ) -> list[dict]:
-    """Query Log Observer for recent log records."""
-    filters: list[dict] = []
-    if service:
-        filters.append({"field": "service.name", "values": [service], "type": "field.value"})
-    if environment:
-        filters.append({
-            "OR": [
-                {"field": "deployment.environment", "values": [environment], "type": "field.value"},
-                {"field": "sf_environment", "values": [environment], "type": "field.value"},
-            ]
-        })
+    """Run a blocking SPL export search against the Splunk Platform REST API.
 
-    body = {
-        "searchQuery": {"filters": filters, "keywords": []},
-        "startTime": start_ms,
-        "endTime": end_ms,
-        "limit": limit,
-        "sources": [{"type": "logs"}],
-    }
+    Uses /services/search/jobs/export which streams results synchronously —
+    no async job management needed.
+
+    Returns a list of event result dicts (Splunk field → value).
+    """
+    url = f"{splunk_url.rstrip('/')}/services/search/jobs/export"
+    body = urllib.parse.urlencode({
+        "search": spl,
+        "output_mode": "json",
+        "count": limit,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Authorization", f"Bearer {splunk_token}")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+    ctx = ssl.create_default_context()
+    if not verify_ssl:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
     try:
-        data = _api_post(api_base, token, "/v1/log/search", body)
-        return data.get("results") or data.get("logs") or []
-    except RuntimeError as e:
-        logger.warning("Log search failed (may not have Log Observer): %s", e)
-        return []
+        with opener.open(req, timeout=60) as resp:
+            records = []
+            for line in resp.read().decode("utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if "result" in obj:
+                        records.append(obj["result"])
+                except json.JSONDecodeError:
+                    pass
+            return records
+    except urllib.error.HTTPError as e:
+        body_text = (e.read() or b"")[:400].decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {e.code}: {body_text}")
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"Request failed: {e}")
 
 
-def _detect_log_mode(log_records: list[dict]) -> str:
-    """
-    Detect whether logs are Unified Identity (native O11y) or Log Observer Connect (Splunk Platform).
-    Returns: 'unified', 'loc', or 'mixed'
-    """
-    unified_count = 0
-    loc_count = 0
-    for record in log_records:
-        fields = set((record.get("fields") or record).keys())
-        if fields & _LOC_INDICATOR_FIELDS:
-            loc_count += 1
-        else:
-            unified_count += 1
+def _build_spl(
+    index: str,
+    lookback_hours: int,
+    service: str | None,
+    environment: str | None,
+    limit: int,
+) -> str:
+    """Build an SPL query to fetch recent log events scoped to service/environment."""
+    filters = [f"index={index}", f"earliest=-{lookback_hours}h", "latest=now"]
 
-    if loc_count > 0 and unified_count > 0:
-        return "mixed"
-    if loc_count > 0:
-        return "loc"
-    return "unified"
+    # OTel field names with dots — single-quote the field name in SPL
+    if service:
+        filters.append(f"'service.name'=\"{service}\"")
+    if environment:
+        # Try both OTel and legacy field names
+        filters.append(
+            f"('deployment.environment'=\"{environment}\" OR sf_environment=\"{environment}\")"
+        )
+
+    return "search " + " ".join(filters) + f" | head {limit}"
 
 
-def _extract_log_fields(record: dict) -> dict[str, str]:
-    """Flatten a log record to a field dict."""
-    if "fields" in record and isinstance(record["fields"], dict):
-        fields = dict(record["fields"])
-    else:
-        fields = {k: v for k, v in record.items() if k not in ("body", "message", "_raw")}
+def _extract_fields(record: dict) -> dict[str, str]:
+    """Flatten a Splunk event result to a normalised field dict."""
+    fields: dict[str, str] = {k: str(v) for k, v in record.items() if v is not None and v != ""}
 
-    # Normalize common aliases
+    # Normalise common aliases to canonical names used in LOC_RULES
     for canonical, aliases in [
-        ("trace_id", ["traceId", "trace.id", "traceid"]),
-        ("span_id", ["spanId", "span.id", "spanid"]),
-        ("severity_text", ["level", "log.level", "severity", "loglevel"]),
-        ("host.name", ["host", "hostname"]),
-        ("timestamp", ["time", "@timestamp", "ts"]),
+        ("trace_id",       ["traceId", "trace.id", "traceid", "otel.trace_id"]),
+        ("span_id",        ["spanId", "span.id", "spanid"]),
+        ("severity_text",  ["level", "log.level", "severity", "loglevel", "log_level"]),
+        ("host.name",      ["hostname"]),          # "host" is kept as-is by Splunk
+        ("service.name",   ["service_name"]),
+        ("deployment.environment", ["sf_environment", "environment"]),
+        ("timestamp",      ["_time", "time", "@timestamp", "ts"]),
     ]:
         if canonical not in fields:
             for alias in aliases:
@@ -129,10 +127,10 @@ def _extract_log_fields(record: dict) -> dict[str, str]:
                     fields[canonical] = fields[alias]
                     break
 
-    # Body/message presence
-    for body_key in ("body", "message", "_raw", "msg"):
+    # Body presence — map _raw or message to "body"
+    for body_key in ("message", "msg", "_raw"):
         if record.get(body_key):
-            fields["body"] = str(record[body_key])[:1]
+            fields.setdefault("body", str(record[body_key])[:1])
             break
 
     return fields
@@ -145,44 +143,96 @@ def analyze_logs(
     environment: str | None = None,
     lookback_hours: int = 3,
     sample_size: int = 100,
+    splunk_url: str | None = None,
+    splunk_token: str | None = None,
+    splunk_index: str = "*",
+    verify_ssl: bool = True,
 ) -> dict[str, Any]:
     """
-    Sample recent logs and check for missing fields.
-    Handles both Unified Identity and Log Observer Connect.
+    Query Splunk Platform via the REST API and assess field coverage for LOC.
+
+    Requires splunk_url and splunk_token.  Pass --splunk-url and --splunk-token
+    on the CLI.  If not provided, returns a no-config result.
     """
-    api_base = f"https://api.{realm}.signalfx.com"
-    now_ms = int(time.time() * 1000)
-    start_ms = now_ms - lookback_hours * 3600 * 1000
-
-    logger.info("Logs: sampling log records (lookback=%dh, service=%s, env=%s)", lookback_hours, service, environment)
-
-    log_records = _search_logs(api_base, token, start_ms, now_ms, service, environment, limit=sample_size)
-
-    if not log_records:
+    if not splunk_url or not splunk_token:
         return {
-            "error": None,
-            "mode": "unknown",
+            "error": "not_configured",
+            "mode": "loc",
             "logs_sampled": 0,
-            "findings": [{"rule": "no_data", "severity": "warning",
-                          "message": "No log records found. Log Observer may not be configured, "
-                                     "or no logs were ingested in the lookback window."}],
+            "findings": [{
+                "rule": "no_config",
+                "severity": "warning",
+                "message": (
+                    "Splunk Platform connection not configured. "
+                    "Provide --splunk-url (e.g. https://prd-p-<stack>.splunkcloud.com:8089) "
+                    "and --splunk-token (Splunk Platform Bearer token) to enable log assessment."
+                ),
+            }],
             "score": 0,
         }
 
-    log_mode = _detect_log_mode(log_records)
-    logger.info("Logs: sampled %d records, detected mode=%s", len(log_records), log_mode)
+    logger.info(
+        "Logs: querying Splunk Platform %s (index=%s, service=%s, env=%s)",
+        splunk_url, splunk_index, service, environment,
+    )
 
-    # Choose rules based on detected mode
-    rules = LOC_RULES if log_mode == "loc" else LOGS_RULES
+    spl = _build_spl(splunk_index, lookback_hours, service, environment, sample_size)
+    logger.debug("Logs: SPL = %s", spl)
 
-    total = len(log_records)
+    try:
+        records = _splunk_export(splunk_url, splunk_token, spl, limit=sample_size,
+                                 verify_ssl=verify_ssl)
+    except RuntimeError as e:
+        err = str(e)
+        if "HTTP 401" in err or "HTTP 403" in err:
+            hint = (
+                f"Splunk Platform auth failed ({err[:8]}). "
+                "Verify the token is valid and has search permissions."
+            )
+        elif "HTTP 404" in err:
+            hint = (
+                "Splunk Platform REST API not found (404). "
+                "Check that --splunk-url points to the management endpoint "
+                "(e.g. https://prd-p-<stack>.splunkcloud.com:8089)."
+            )
+        else:
+            hint = f"Splunk Platform search failed: {err}"
+        logger.error(hint)
+        return {
+            "error": hint,
+            "mode": "loc",
+            "logs_sampled": 0,
+            "findings": [{"rule": "api_error", "severity": "warning", "message": hint}],
+            "score": 0,
+        }
+
+    if not records:
+        return {
+            "error": None,
+            "mode": "loc",
+            "logs_sampled": 0,
+            "findings": [{
+                "rule": "no_data",
+                "severity": "warning",
+                "message": (
+                    f"No log records returned from index={splunk_index} in the last "
+                    f"{lookback_hours}h. Verify the index name, time range, and that "
+                    "logs are actively ingesting."
+                ),
+            }],
+            "score": 0,
+        }
+
+    total = len(records)
+    logger.info("Logs: retrieved %d records from Splunk Platform", total)
+
     field_presence: dict[str, int] = defaultdict(int)
     services_seen: set[str] = set()
     trace_id_coverage = 0
 
-    for record in log_records:
-        fields = _extract_log_fields(record)
-        for rule in rules:
+    for record in records:
+        fields = _extract_fields(record)
+        for rule in LOC_RULES:
             candidates = [rule.name] + rule.alternatives
             if any(fields.get(c) for c in candidates):
                 field_presence[rule.name] += 1
@@ -193,7 +243,7 @@ def analyze_logs(
 
     # Build findings
     findings: list[dict] = []
-    for rule in rules:
+    for rule in LOC_RULES:
         present = field_presence[rule.name]
         pct = round(present / total * 100, 1)
         missing_pct = 100 - pct
@@ -202,14 +252,11 @@ def analyze_logs(
             continue
 
         if missing_pct == 100:
-            sev = rule.severity
-            status = "missing"
+            sev, status = rule.severity, "missing"
         elif missing_pct >= 50:
-            sev = rule.severity
-            status = "partial"
+            sev, status = rule.severity, "partial"
         else:
-            sev = "info"
-            status = "partial"
+            sev, status = "info", "partial"
 
         findings.append({
             "field": rule.name,
@@ -223,37 +270,27 @@ def analyze_logs(
             "purpose": rule.purpose,
         })
 
-    # Trace correlation coverage
     trace_pct = round(trace_id_coverage / total * 100, 1)
-    rc_gaps = _check_rc_gaps_logs(field_presence, total, log_mode)
-
-    # LOC-specific checks
-    loc_findings = []
-    if log_mode in ("loc", "mixed"):
-        loc_findings = _check_loc_specific(log_records)
-
-    score = _compute_score(findings, total)
+    rc_gaps = _check_rc_gaps(field_presence, total)
+    score = _compute_score(findings)
 
     return {
         "error": None,
-        "mode": log_mode,
-        "mode_description": {
-            "unified": "Unified Identity (native Splunk Observability logs)",
-            "loc": "Log Observer Connect (Splunk Platform logs)",
-            "mixed": "Mixed — both native and Splunk Platform logs detected",
-            "unknown": "Could not determine log mode",
-        }.get(log_mode, log_mode),
+        "mode": "loc",
+        "mode_description": "Log Observer Connect (Splunk Platform logs)",
         "logs_sampled": total,
         "services_seen": sorted(services_seen),
         "trace_id_coverage_pct": trace_pct,
-        "findings": sorted(findings, key=lambda f: ({"critical": 0, "warning": 1, "info": 2}[f["severity"]], -f["missing_pct"])),
+        "findings": sorted(findings, key=lambda f: (
+            {"critical": 0, "warning": 1, "info": 2}[f["severity"]], -f["missing_pct"]
+        )),
         "related_content_gaps": rc_gaps,
-        "loc_findings": loc_findings,
+        "loc_findings": [],
         "score": score,
     }
 
 
-def _check_rc_gaps_logs(field_presence: dict[str, int], total: int, mode: str) -> list[dict]:
+def _check_rc_gaps(field_presence: dict[str, int], total: int) -> list[dict]:
     gaps = []
     if total == 0:
         return gaps
@@ -266,17 +303,21 @@ def _check_rc_gaps_logs(field_presence: dict[str, int], total: int, mode: str) -
             "link": "Logs → APM",
             "severity": "critical",
             "missing": ["service.name"],
-            "impact": "Logs cannot be correlated to APM services. "
-                      "Log Observer service filter will not work.",
+            "impact": (
+                "Logs cannot be correlated to APM services in Log Observer Connect. "
+                "Add a field extraction or transform in Splunk Platform to populate service.name."
+            ),
         })
 
-    if not _has("deployment.environment"):
+    if not (_has("deployment.environment") or _has("sf_environment")):
         gaps.append({
             "link": "Logs → APM / IM",
             "severity": "critical",
             "missing": ["deployment.environment"],
-            "impact": "Logs cannot be scoped to environment. "
-                      "Related Content links from APM to logs will fail.",
+            "impact": (
+                "Logs cannot be scoped to an environment. "
+                "Related Content links from APM traces to logs will fail."
+            ),
         })
 
     if not _has("trace_id"):
@@ -284,63 +325,30 @@ def _check_rc_gaps_logs(field_presence: dict[str, int], total: int, mode: str) -
             "link": "Logs → APM (trace linking)",
             "severity": "warning",
             "missing": ["trace_id"],
-            "impact": "Individual log records cannot be linked to specific traces. "
-                      "Trace view 'Related Logs' panel will be empty.",
+            "impact": (
+                "Log records cannot be linked to specific APM traces. "
+                "The trace view 'Related Logs' panel will be empty."
+            ),
         })
 
     if not (_has("host.name") or _has("host")):
         gaps.append({
             "link": "Logs → Infrastructure Monitoring",
             "severity": "warning",
-            "missing": ["host.name / host"],
-            "impact": "Logs cannot be correlated to host-level metrics. "
-                      "Host Navigator 'Related Logs' will be empty.",
+            "missing": ["host / host.name"],
+            "impact": (
+                "Logs cannot be correlated to host-level metrics. "
+                "Host Navigator 'Related Logs' will be empty."
+            ),
         })
 
     return gaps
 
 
-def _check_loc_specific(log_records: list[dict]) -> list[dict]:
-    """Log Observer Connect specific checks."""
-    findings = []
-    has_source = any(
-        (r.get("fields") or r).get("source") or (r.get("fields") or r).get("sourcetype")
-        for r in log_records
-    )
-    has_index = any((r.get("fields") or r).get("index") for r in log_records)
-
-    if not has_source:
-        findings.append({
-            "check": "LOC source/sourcetype",
-            "severity": "info",
-            "message": "source/sourcetype fields not detected in LOC logs — "
-                       "confirm Splunk Platform field extraction is configured.",
-        })
-
-    # Check for service.name in LOC logs (often missing since Splunk doesn't inject it)
-    has_service = any(
-        (r.get("fields") or r).get("service.name")
-        for r in log_records
-    )
-    if not has_service:
-        findings.append({
-            "check": "LOC service.name injection",
-            "severity": "critical",
-            "message": "service.name not found in Log Observer Connect logs. "
-                       "Configure a field alias or transform in Splunk Platform to inject "
-                       "service.name before forwarding to Observability Cloud.",
-        })
-
-    return findings
-
-
-def _compute_score(findings: list[dict], total: int) -> int:
-    if total == 0:
-        return 0
+def _compute_score(findings: list[dict]) -> int:
     weights = {"critical": 3, "warning": 2, "info": 1}
-    max_weight = sum(weights[r.severity] for r in LOGS_RULES)
-    deductions = 0
-    for f in findings:
-        w = weights.get(f["severity"], 1)
-        deductions += w * (f["missing_pct"] / 100)
+    max_weight = sum(weights[r.severity] for r in LOC_RULES)
+    if max_weight == 0:
+        return 100
+    deductions = sum(weights.get(f["severity"], 1) * (f["missing_pct"] / 100) for f in findings)
     return max(0, round(100 - (deductions / max_weight * 100)))

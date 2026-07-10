@@ -75,6 +75,24 @@ def parse_args() -> argparse.Namespace:
     signals.add_argument("--skip-metrics", action="store_true", help="Skip infrastructure metrics analysis")
     signals.add_argument("--skip-logs", action="store_true", help="Skip log analysis")
 
+    # Splunk Platform (Log Observer Connect)
+    loc = parser.add_argument_group("log observer connect (Splunk Platform)")
+    loc.add_argument("--splunk-url", default=os.environ.get("SPLUNK_PLATFORM_URL"),
+                     metavar="URL",
+                     help="Splunk Platform management endpoint "
+                          "(e.g. https://prd-p-<stack>.splunkcloud.com:8089). "
+                          "Required for log analysis. (or set SPLUNK_PLATFORM_URL env var)")
+    loc.add_argument("--splunk-token", default=os.environ.get("SPLUNK_PLATFORM_TOKEN"),
+                     metavar="TOKEN",
+                     help="Splunk Platform Bearer token with search permissions. "
+                          "Create in Splunk Platform: Settings → Tokens. "
+                          "(or set SPLUNK_PLATFORM_TOKEN env var)")
+    loc.add_argument("--splunk-index", default="*", metavar="INDEX",
+                     help="Splunk index to search for logs (default: * = all accessible)")
+    loc.add_argument("--no-verify-ssl", action="store_true",
+                     help="Disable SSL certificate verification for Splunk Platform "
+                          "(use for self-signed certs in Splunk Enterprise)")
+
     # Output
     output = parser.add_argument_group("output")
     output.add_argument("--format", choices=["md", "json", "html", "all"], default="md",
@@ -202,6 +220,10 @@ def _run_signals(
             service=args.service, environment=env,
             lookback_hours=args.lookback_hours,
             sample_size=args.logs_sample_size,
+            splunk_url=args.splunk_url,
+            splunk_token=args.splunk_token,
+            splunk_index=args.splunk_index,
+            verify_ssl=not args.no_verify_ssl,
         )
         logs = logs_result.get("logs_sampled", 0)
         mode = logs_result.get("mode", "unknown")

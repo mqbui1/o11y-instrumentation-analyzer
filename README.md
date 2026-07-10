@@ -21,12 +21,12 @@ Works with both **Unified Identity** (native O11y logs) and **Log Observer Conne
 - Kubernetes dimensions (pod, node, cluster, namespace)
 - Service-level runtime metrics (JVM, .NET, Node.js)
 
-**Logs**
+**Logs (Log Observer Connect)**
+- Queries Splunk Platform (Cloud or Enterprise) directly via the REST API
 - `service.name`, `deployment.environment` — Log Observer service filter + Related Content
 - `trace_id`, `span_id` — APM ↔ Logs trace-level correlation
-- `host.name` — Infrastructure Monitoring ↔ Logs correlation
-- Auto-detects Unified Identity vs Log Observer Connect logs
-- LOC-specific check: `service.name` injection from Splunk Platform
+- `host` / `host.name` — Infrastructure Monitoring ↔ Logs correlation
+- Requires `--splunk-url` and `--splunk-token` (Splunk Platform credentials)
 
 **Cross-signal Related Content links**
 - APM → Infrastructure Monitoring (Service Centric view infrastructure tab)
@@ -57,6 +57,13 @@ python3 analyze.py --realm us1 --token $TOKEN --format all --output ./reports/
 # Use env var for token
 export SPLUNK_ACCESS_TOKEN=<your_token>
 python3 analyze.py --realm us0 --format json | jq .correlation
+
+# Include log analysis via Log Observer Connect (Splunk Platform)
+python3 analyze.py --realm us0 --token $TOKEN \
+  --splunk-url https://prd-p-<stack>.splunkcloud.com:8089 \
+  --splunk-token $SPLUNK_PLATFORM_TOKEN \
+  --splunk-index otel_logs \
+  --format html --output report.html
 ```
 
 ### Per-environment breakdown
@@ -121,6 +128,16 @@ Signals:
   --skip-apm                 Skip APM trace analysis
   --skip-metrics             Skip infrastructure metrics analysis
   --skip-logs                Skip log analysis
+
+Log Observer Connect (Splunk Platform):
+  --splunk-url URL           Splunk Platform management endpoint
+                             e.g. https://prd-p-<stack>.splunkcloud.com:8089
+                             (or set SPLUNK_PLATFORM_URL env var)
+  --splunk-token TOKEN       Splunk Platform Bearer token with search permissions.
+                             Create in Splunk Platform: Settings → Tokens.
+                             (or set SPLUNK_PLATFORM_TOKEN env var)
+  --splunk-index INDEX       Splunk index to search (default: * = all accessible)
+  --no-verify-ssl            Disable SSL verification (Splunk Enterprise self-signed certs)
 
 Output:
   --format {md,json,html,all} Output format (default: md)
