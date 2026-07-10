@@ -153,8 +153,15 @@ def analyze_apm(
     services_seen: set[str] = set()
     environments_seen: set[str] = set()
 
+    def _safe_get_trace(tid: str) -> list[dict]:
+        try:
+            return _get_trace_full(app_base, token, tid)
+        except RuntimeError as e:
+            logger.debug("APM: failed to fetch trace %s: %s", tid, e)
+            return []
+
     with ThreadPoolExecutor(max_workers=10) as ex:
-        span_batches = list(ex.map(lambda tid: _get_trace_full(app_base, token, tid), trace_ids))
+        span_batches = list(ex.map(_safe_get_trace, trace_ids))
 
     for spans in span_batches:
         for span in spans:

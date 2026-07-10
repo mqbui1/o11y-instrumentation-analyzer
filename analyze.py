@@ -229,7 +229,13 @@ def _run_breakdown(args: argparse.Namespace, realm: str, token: str) -> int:
 
     for i, env in enumerate(environments, 1):
         print(f"\n  [{i}/{len(environments)}] {env}", file=sys.stderr)
-        apm_result, metrics_result, logs_result = _run_signals(args, realm, token, environment=env)
+        try:
+            apm_result, metrics_result, logs_result = _run_signals(args, realm, token, environment=env)
+        except Exception as e:
+            print(f"    [ERROR] {e}", file=sys.stderr)
+            apm_result = _empty_result("APM")
+            metrics_result = _empty_result("Metrics")
+            logs_result = _empty_result("Logs")
         correlation = check_cross_signal_correlation(apm_result, metrics_result, logs_result)
 
         overall = correlation.get("overall_status", "unknown")
