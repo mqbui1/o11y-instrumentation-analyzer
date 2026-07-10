@@ -4,9 +4,6 @@ Analyzes APM spans, infrastructure metrics, and logs for missing attributes and
 dimensions that break Related Content, Service Centric view, and runtime metrics
 in Splunk Observability Cloud.
 
-Works with both **Unified Identity** (native O11y logs) and **Log Observer Connect**
-(Splunk Platform logs linked via LOC).
-
 ## What it checks
 
 **APM (traces/spans)**
@@ -21,12 +18,10 @@ Works with both **Unified Identity** (native O11y logs) and **Log Observer Conne
 - Kubernetes dimensions (pod, node, cluster, namespace)
 - Service-level runtime metrics (JVM, .NET, Node.js)
 
-**Logs (Log Observer Connect)**
-- Queries Splunk Platform (Cloud or Enterprise) directly via the REST API
+**Logs** — see [Log Analysis Modes](#log-analysis-modes) below
 - `service.name`, `deployment.environment` — Log Observer service filter + Related Content
 - `trace_id`, `span_id` — APM ↔ Logs trace-level correlation
 - `host` / `host.name` — Infrastructure Monitoring ↔ Logs correlation
-- Requires `--splunk-url` and `--splunk-token` (Splunk Platform credentials)
 
 **Cross-signal Related Content links**
 - APM → Infrastructure Monitoring (Service Centric view infrastructure tab)
@@ -37,41 +32,139 @@ Works with both **Unified Identity** (native O11y logs) and **Log Observer Conne
 
 - Python 3.10+
 - No third-party packages required (stdlib only)
-- A Splunk Observability API access token with read access to APM, metrics, and logs
+- A Splunk Observability Cloud API access token with read access to APM and metrics
+
+## Log Analysis Modes
+
+Splunk Observability Cloud does not store logs natively. Logs live in Splunk Platform
+(Cloud or Enterprise) and are surfaced in O11y through **Log Observer Connect (LOC)**.
+The analyzer queries Splunk Platform directly via its REST API.
+
+There are two authentication models depending on how your org is configured:
+
+---
+
+### Mode 1 — Log Observer Connect (dedicated service account)
+
+Used when LOC is configured with a dedicated Splunk Platform service account.
+The service account was created in Splunk Platform specifically for the LOC connection
+and registered under **Splunk Observability Cloud → Admin → Log Observer Connect**.
+
+**Credentials needed:**
+
+| What | Where to get it |
+|------|----------------|
+| Splunk Platform management URL | `https://prd-p-<stack>.splunkcloud.com:8089` — from the Splunk Cloud admin console |
+| Splunk Platform service account token | Splunk Platform → Settings → Tokens → New Token (assign to the LOC service account, needs `search` capability on the target index) |
+| Index name(s) | The Splunk index(es) where logs land, e.g. `main`, `otel_logs` |
+
+```bash
+python3 analyze.py \
+  --realm us0 --token $O11Y_TOKEN \
+  --splunk-url https://prd-p-<stack>.splunkcloud.com:8089 \
+  --splunk-token $SPLUNK_SERVICE_ACCOUNT_TOKEN \
+  --splunk-index otel_logs \
+  --environments prod,staging,dev \
+  --format html --output report.html
+```
+
+---
+
+### Mode 2 — Log Observer Connect with Unified Identity
+
+Used when Splunk Cloud Platform and Splunk Observability Cloud share a **Unified Identity**
+(federated authentication). Users and service principals authenticate through a common
+identity layer, so a single Splunk Cloud Platform token grants access to both products.
+
+The token is a Splunk Cloud Platform API token issued to a principal that has **both**
+Splunk Observability Cloud access and Splunk Platform search permissions on the relevant
+indexes. It is obtained via the Splunk Cloud Platform identity system (not the traditional
+Settings → Tokens path).
+
+**Credentials needed:**
+
+| What | Where to get it |
+|------|----------------|
+| Splunk Platform management URL | Same as Mode 1 — `https://prd-p-<stack>.splunkcloud.com:8089` |
+| Splunk Cloud unified identity token | Splunk Cloud Platform → user/service principal API token with search permissions. The principal must have the `search` capability scoped to the relevant indexes. |
+| Index name(s) | Same as Mode 1 |
+
+```bash
+python3 analyze.py \
+  --realm us0 --token $O11Y_TOKEN \
+  --splunk-url https://prd-p-<stack>.splunkcloud.com:8089 \
+  --splunk-token $SPLUNK_UNIFIED_IDENTITY_TOKEN \
+  --splunk-index otel_logs \
+  --environments prod,staging,dev \
+  --format html --output report.html
+```
+
+> **Note:** Both modes use identical CLI flags and the same Splunk Platform REST API
+> (`/services/search/jobs/export`). The only difference is the token source and the
+> account it represents.
+
+---
+
+### Per-environment index mapping
+
+If different environments land in different Splunk indexes, use `--splunk-index-map`:
+
+```bash
+python3 analyze.py \
+  --realm us0 --token $O11Y_TOKEN \
+  --splunk-url https://prd-p-<stack>.splunkcloud.com:8089 \
+  --splunk-token $SPLUNK_TOKEN \
+  --splunk-index-map "prod=tiaa_prod_logs,staging=tiaa_staging_logs,dev=tiaa_dev_logs" \
+  --environments prod,staging,dev \
+  --format html --output report.html
+```
+
+Environments not in the map fall back to `--splunk-index` (default: `*`).
+
+---
+
+### Verify Splunk connectivity before running
+
+```bash
+curl -s -k -X POST \
+  "https://prd-p-<stack>.splunkcloud.com:8089/services/search/jobs/export" \
+  -H "Authorization: Bearer <your-token>" \
+  -d "search=search index=<index> earliest=-1h | head 3 | spath input=_raw | fieldsummary" \
+  -d "output_mode=json" -d "count=50" | \
+  python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        obj = json.loads(line.strip())
+        if 'result' in obj:
+            r = obj['result']
+            print(f\"{r.get('field',''):40s}  count={r.get('count',''):5s}\")
+    except: pass
+"
+```
+
+This lists every field present on recent events — confirm `service.name`,
+`deployment.environment`, `trace_id`, and `host` appear before running the full analysis.
+
+---
 
 ## Usage
 
 ```bash
-# Basic analysis — entire org, last 3 hours
-python3 analyze.py --realm us1 --token <your_token>
+# APM + Metrics only (no logs)
+python3 analyze.py --realm us1 --token $O11Y_TOKEN --skip-logs
 
 # Scope to a specific service and environment
-python3 analyze.py --realm us1 --token $TOKEN --service frontend --environment production
+python3 analyze.py --realm us1 --token $O11Y_TOKEN \
+  --service frontend --environment production
 
 # Output as HTML report
-python3 analyze.py --realm us1 --token $TOKEN --format html --output report.html
-
-# Output all three formats to a directory
-python3 analyze.py --realm us1 --token $TOKEN --format all --output ./reports/
-
-# Use env var for token
-export SPLUNK_ACCESS_TOKEN=<your_token>
-python3 analyze.py --realm us0 --format json | jq .correlation
-
-# Include log analysis via Log Observer Connect — single index
-python3 analyze.py --realm us0 --token $TOKEN \
-  --splunk-url https://prd-p-<stack>.splunkcloud.com:8089 \
-  --splunk-token $SPLUNK_PLATFORM_TOKEN \
-  --splunk-index otel_logs \
+python3 analyze.py --realm us1 --token $O11Y_TOKEN \
   --format html --output report.html
 
-# LOC with per-environment index mapping (different index per environment)
-python3 analyze.py --realm us0 --token $TOKEN \
-  --splunk-url https://prd-p-<stack>.splunkcloud.com:8089 \
-  --splunk-token $SPLUNK_PLATFORM_TOKEN \
-  --splunk-index-map "prod=tiaa_prod_logs,staging=tiaa_staging_logs,dev=tiaa_dev_logs" \
-  --environments prod,staging,dev \
-  --format html --output report.html
+# All three formats to a directory
+python3 analyze.py --realm us1 --token $O11Y_TOKEN \
+  --format all --output ./reports/
 ```
 
 ### Per-environment breakdown
