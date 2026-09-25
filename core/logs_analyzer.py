@@ -90,6 +90,27 @@ def _splunk_export(
         raise RuntimeError(f"Request failed: {e}")
 
 
+# Splunk's /services/search/jobs/export only serializes fields that are
+# referenced somewhere in the SPL pipeline (search-time filters, table,
+# stats, fields, etc.) — a plain `head N` with no field references silently
+# omits fields like service.name/trace_id/span_id from the returned JSON,
+# even when they are fully populated indexed fields on every event. Confirmed
+# live 2026-09-25: an identical query with `| table service.name, trace_id,
+# span_id` on the exact same events returned 100% coverage, while the bare
+# `head`-only query returned 0% for every one of these — a false "missing
+# field" reading purely from lazy export-time field materialization, not
+# real data absence. Force materialization by explicitly referencing every
+# field _extract_fields() looks for. `fields` keeps internal fields
+# (_time, _raw, host, source, sourcetype, index) automatically.
+_MATERIALIZE_FIELDS = [
+    "service.name", "deployment.environment", "sf_environment",
+    "trace_id", "traceId", "span_id", "spanId",
+    "host", "host.name", "hostname",
+    "severity_text", "level", "log.level", "severity",
+    "timestamp", "time", "@timestamp",
+]
+
+
 def _build_spl(
     index: str,
     lookback_hours: int,
@@ -109,9 +130,20 @@ def _build_spl(
             f"('deployment.environment'=\"{environment}\" OR sf_environment=\"{environment}\")"
         )
 
+    # No quoting here — unlike eval/comparison contexts, the `fields` command
+    # takes bare field names and quoting them makes Splunk look for a field
+    # literally named "'service.name'" (with quote characters), matching
+    # nothing. Confirmed live: quoted version broke deployment.environment
+    # too (previously 100% via the filter clause), unquoted fixes it.
+    field_list = ", ".join(_MATERIALIZE_FIELDS)
+
     # | spath extracts JSON fields from _raw — handles OTel logs stored as JSON blobs
     # without pre-configured field extractions in Splunk
-    return "search " + " ".join(filters) + f" | head {limit} | spath input=_raw"
+    # | fields — forces materialization, see _MATERIALIZE_FIELDS comment above
+    return (
+        "search " + " ".join(filters)
+        + f" | head {limit} | spath input=_raw | fields {field_list}"
+    )
 
 
 def _extract_fields(record: dict) -> dict[str, str]:
