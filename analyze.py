@@ -34,6 +34,7 @@ import argparse
 import logging
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from core import analyze_apm, analyze_logs, analyze_metrics, check_cross_signal_correlation, discover_environments
@@ -209,40 +210,26 @@ def _run_signals(
     """Run APM, metrics, and logs analyzers and return their results."""
     env = environment if environment is not None else args.environment
 
-    if args.skip_apm:
-        apm_result = _empty_result("APM")
-    else:
-        apm_result = analyze_apm(
+    # APM, metrics, and logs are independent signal types with no data
+    # dependency between them — run concurrently instead of sequentially.
+    # Confirmed live: this call took 5:47 sequential on its own.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        apm_fut = None if args.skip_apm else pool.submit(
+            analyze_apm,
             realm=realm, token=token,
             service=args.service, environment=env,
             lookback_hours=args.lookback_hours,
             sample_size=args.apm_sample_size,
         )
-        spans = apm_result.get("spans_sampled", 0)
-        score = apm_result.get("score", 0)
-        err = apm_result.get("error")
-        if err:
-            print(f"    [APM] ERROR: {err}", file=sys.stderr)
-        else:
-            print(f"    [APM] {spans} spans, score={score}/100", file=sys.stderr)
-
-    if args.skip_metrics:
-        metrics_result = _empty_result("Metrics")
-    else:
-        metrics_result = analyze_metrics(
+        metrics_fut = None if args.skip_metrics else pool.submit(
+            analyze_metrics,
             realm=realm, token=token,
             service=args.service, environment=env,
             lookback_hours=args.lookback_hours,
             sample_size=args.metrics_sample_size,
         )
-        mts = metrics_result.get("mts_sampled", 0)
-        score = metrics_result.get("score", 0)
-        print(f"    [Metrics] {mts} MTS, score={score}/100", file=sys.stderr)
-
-    if args.skip_logs:
-        logs_result = _empty_result("Logs")
-    else:
-        logs_result = analyze_logs(
+        logs_fut = None if args.skip_logs else pool.submit(
+            analyze_logs,
             realm=realm, token=token,
             service=args.service, environment=env,
             lookback_hours=args.lookback_hours,
@@ -252,6 +239,26 @@ def _run_signals(
             splunk_index=_resolve_splunk_index(args, env),
             verify_ssl=not args.no_verify_ssl,
         )
+
+        apm_result = _empty_result("APM") if apm_fut is None else apm_fut.result()
+        metrics_result = _empty_result("Metrics") if metrics_fut is None else metrics_fut.result()
+        logs_result = _empty_result("Logs") if logs_fut is None else logs_fut.result()
+
+    if apm_fut is not None:
+        spans = apm_result.get("spans_sampled", 0)
+        score = apm_result.get("score", 0)
+        err = apm_result.get("error")
+        if err:
+            print(f"    [APM] ERROR: {err}", file=sys.stderr)
+        else:
+            print(f"    [APM] {spans} spans, score={score}/100", file=sys.stderr)
+
+    if metrics_fut is not None:
+        mts = metrics_result.get("mts_sampled", 0)
+        score = metrics_result.get("score", 0)
+        print(f"    [Metrics] {mts} MTS, score={score}/100", file=sys.stderr)
+
+    if logs_fut is not None:
         logs = logs_result.get("logs_sampled", 0)
         mode = logs_result.get("mode", "unknown")
         score = logs_result.get("score", 0)
